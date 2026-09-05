@@ -1,0 +1,165 @@
+#!/bin/bash
+# Read-only board dump for DCP/USB bring-up. Testers: sudo omarchy-mac-dump-board
+# then send the tarball. Does not write boot.bin, firmware trees, or partition tables.
+set -euo pipefail
+
+fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
+log() { printf '==> %s\n' "$*"; }
+
+[[ $(id -u) -eq 0 ]] || fail "run as root (sudo omarchy-mac-dump-board)"
+
+dt=/sys/firmware/devicetree/base
+[[ -d $dt ]] || fail "no device-tree (not Apple Silicon / not booted via m1n1?)"
+
+compat=$(tr '\0' ' ' <"$dt/compatible" 2>/dev/null || true)
+model=$(tr '\0' '\n' <"$dt/model" 2>/dev/null | head -1 || true)
+board=$(printf '%s' "$compat" | tr ' ' '\n' | grep -m1 '^apple,j' || printf 'unknown')
+board=${board#apple,}
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+work=$(mktemp -d /tmp/omarchy-mac-board.XXXXXX)
+dest=$work/${board}-${stamp}
+mkdir -p "$dest/dt" "$dest/drm" "$dest/m1n1"
+trap 'rm -rf "$work"' EXIT
+
+save() {
+  local file=$1
+  shift
+  { "$@" ; } >"$dest/$file" 2>&1 || true
+}
+
+log "board $board ($model)"
+{
+  printf 'board: %s\n' "$board"
+  printf 'model: %s\n' "$model"
+  printf 'compatible: %s\n' "$compat"
+  printf 'kernel: %s\n' "$(uname -a)"
+  printf 'collected: %s\n' "$stamp"
+  printf 'script: omarchy-mac-dump-board (read-only)\n'
+} >"$dest/REPORT.txt"
+
+save uname.txt uname -a
+save cpuinfo.txt sed -n '1,40p' /proc/cpuinfo
+save compatible.txt printf '%s\n' "$compat"
+save lsmod-apple.txt bash -c 'lsmod | grep -iE "apple|drm|sn201|tps6598|dwc3|xhci|typec" || true'
+save lsblk.txt lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTLABEL,TRAN
+save iomem.txt cat /proc/iomem
+save dmesg-display.txt bash -c 'dmesg | grep -iE "drm|dcp|simplefb|simple-framebuffer|appledrm|notch" || true'
+save dmesg-usb.txt bash -c 'dmesg | grep -iE "usb|dwc3|xhci|typec|sn201|tps6598|cd321" || true'
+save drm-class.txt bash -c 'ls -l /sys/class/drm; echo; for n in /sys/class/drm/card*-*; do [[ -e $n/status ]] || continue; printf "%s status=%s modes=%s\n" "$n" "$(cat "$n/status" 2>/dev/null)" "$(tr "\n" "," <"$n/modes" 2>/dev/null)"; done'
+save fb.txt bash -c 'cat /sys/class/graphics/fb0/virtual_size 2>/dev/null; echo; cat /sys/class/graphics/fb0/name 2>/dev/null; echo; cat /sys/module/appledrm/parameters/show_notch 2>/dev/null || true'
+save typec.txt bash -c 'ls /sys/class/typec 2>/dev/null; ls /sys/bus/usb/devices 2>/dev/null'
+save dt-has-dcp.txt bash -c 'grep -aR -E "apple,.*dcp|apple,display-subsystem|apple,simple-framebuffer" /sys/firmware/devicetree/base 2>/dev/null | head -50 || true'
+
+if command -v dtc >/dev/null; then
+  dtc -I fs -O dts -o "$dest/dt/running.dts" /proc/device-tree 2>"$dest/dt/dtc.warn" || true
+  dtc -I fs -O dtb -o "$dest/dt/running.dtb" /proc/device-tree 2>/dev/null || true
+else
+  printf 'dtc not installed\n' >"$dest/dt/skipped.txt"
+  find /proc/device-tree -name compatible -print0 2>/dev/null \
+    | sort -z \
+    | while IFS= read -r -d '' f; do
+        printf '%s: %s\n' "${f#/proc/device-tree}" "$(tr '\0' ' ' <"$f")"
+      done >"$dest/dt/compatibles.txt" || true
+fi
+
+boot_bin=""
+for cand in /boot/m1n1/boot.bin /boot/efi/m1n1/boot.bin /efi/m1n1/boot.bin; do
+  [[ -f $cand ]] && boot_bin=$cand && break
+done
+esp_mnt=""
+if [[ -z $boot_bin ]]; then
+  esp_dev=$(lsblk -ln -o NAME,FSTYPE,LABEL | awk '$2=="vfat" && $3 ~ /EFI/{print $1; exit}')
+  if [[ -n $esp_dev ]]; then
+    esp_mnt=$(mktemp -d)
+    if mount -o ro "/dev/$esp_dev" "$esp_mnt" 2>/dev/null; then
+      [[ -f $esp_mnt/m1n1/boot.bin ]] && boot_bin=$esp_mnt/m1n1/boot.bin
+    else
+      rmdir "$esp_mnt" || true
+      esp_mnt=""
+    fi
+  fi
+fi
+
+if [[ -n $boot_bin ]]; then
+  log "copying m1n1/boot.bin (read-only) from $boot_bin"
+  cp -a "$boot_bin" "$dest/m1n1/boot.bin"
+  sha256sum "$boot_bin" >"$dest/m1n1/boot.bin.sha256"
+  python3 - "$boot_bin" "$dest/m1n1" <<'PY'
+import os, struct, sys
+magic = b"\xd0\x0d\xfe\xed"
+boot_path, out_dir = sys.argv[1], sys.argv[2]
+boot = open(boot_path, "rb").read()
+off, n = 0, 0
+index = []
+while True:
+    off = boot.find(magic, off)
+    if off < 0:
+        break
+    if off + 8 > len(boot):
+        break
+    total = struct.unpack(">I", boot[off + 4 : off + 8])[0]
+    if 0x1000 <= total <= 0x100000 and off + total <= len(boot):
+        blob = boot[off : off + total]
+        n += 1
+        path = os.path.join(out_dir, f"slot-{n:02d}.dtb")
+        open(path, "wb").write(blob)
+        compat = []
+        i = 0
+        while True:
+            j = blob.find(b"apple,", i)
+            if j < 0:
+                break
+            end = blob.find(b"\0", j)
+            if end < 0:
+                break
+            compat.append(blob[j:end].decode("ascii", "replace"))
+            i = end + 1
+        has_dcp = b"apple,dcp" in blob or b"-dcp" in blob
+        index.append(
+            f"slot-{n:02d} off=0x{off:x} len={total} dcp={int(has_dcp)} {' '.join(compat[:8])}"
+        )
+        off += total
+    else:
+        off += 4
+open(os.path.join(out_dir, "slots.txt"), "w").write("\n".join(index) + "\n")
+print(f"extracted {n} FDT slots")
+PY
+  if command -v dtc >/dev/null; then
+    for dtb in "$dest/m1n1"/slot-*.dtb; do
+      [[ -f $dtb ]] || continue
+      dtc -I dtb -O dts -o "${dtb%.dtb}.dts" "$dtb" 2>/dev/null || true
+    done
+  fi
+else
+  printf 'm1n1/boot.bin not found (ESP not mounted?)\n' >"$dest/m1n1/missing.txt"
+fi
+
+if [[ -n $esp_mnt ]]; then
+  umount "$esp_mnt" || true
+  rmdir "$esp_mnt" || true
+fi
+
+{
+  printf '\n--- overlay hint ---\n'
+  if grep -aR -q -E 'apple,.*dcp|apple,display-subsystem' "$dt" 2>/dev/null; then
+    printf 'Running DT already has DCP/display-subsystem. An overlay may not be needed.\n'
+  else
+    printf 'Running DT has no DCP nodes. This tarball is the FDT + m1n1 slots.\n'
+    printf 'A DCP overlay still needs ADT MMIO (m1n1 dump) if apple-drm does not bind.\n'
+  fi
+} >>"$dest/REPORT.txt"
+
+tarball=""
+if command -v zstd >/dev/null; then
+  tarball=/tmp/omarchy-mac-board-${board}-${stamp}.tar.zst
+  tar -C "$work" -cf - "$(basename "$dest")" | zstd -q -o "$tarball"
+else
+  tarball=/tmp/omarchy-mac-board-${board}-${stamp}.tar.gz
+  tar -C "$work" -czf "$tarball" "$(basename "$dest")"
+fi
+chmod a+r "$tarball"
+log "wrote $tarball"
+log "send that file (display, USB, and the REPORT.txt inside)"
+printf '%s\n' "$tarball"
+trap - EXIT
+rm -rf "$work"

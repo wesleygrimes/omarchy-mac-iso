@@ -82,7 +82,7 @@ bootefi ${kernel_addr_r} ${fdtcontroladdr}
 
 Live boot is meant to be quiet (`loglevel=0`, systemd status off, Plymouth and ldconfig masked on the installer USB only). Installed disks keep `quiet splash` and branded Plymouth.
 
-M3 (`apple,j613`) display needs `linux-asahi` **>= 7.2** (appledrm V14_7) plus the DCP nodes in m1n1's bundled DTB. A 7.1.6 image boots `simpledrm` only. Build on a 7.2 host, or set `OMARCHY_KVER` / `OMARCHY_VMLINUZ` / `OMARCHY_MODULES_DIR`. The installer then overlays `configs/m1n1/j613-dcp.dtbo` into the j613 slot of the existing `m1n1/boot.bin` (backup `.bak-predcp`). It does not use GRUB `devicetree` and does not write extlinux. Unencrypted roots get `initramfs-linux-asahi-plain.img` (no `encrypt` hook). `OMARCHY_ALLOW_OLD_APPLEDRM=1` forces a simpledrm-capable 7.1 image.
+M3 (`apple,j613`) display needs `linux-asahi` **>= 7.2** (appledrm V14_7) plus the DCP nodes in m1n1's bundled DTB. A 7.1.6 image boots `simpledrm` only. Build on a 7.2 host, or set `OMARCHY_KVER` / `OMARCHY_VMLINUZ` / `OMARCHY_MODULES_DIR`. The installer then overlays `configs/m1n1/j613-dcp.dtbo` into the j613 slot of the existing `m1n1/boot.bin` (backup `.bak-predcp`). It does not use GRUB `devicetree` and does not write extlinux. Unencrypted roots get `initramfs-linux-asahi-plain.img` (no `encrypt` hook). `OMARCHY_ALLOW_OLD_APPLEDRM=1` forces a simpledrm-capable 7.1 image. M3 Air Type-C PD is SPMI `sn201202x` (not I2C `tps6598x`); live and install initrds list `sn201202x?`. The kernel needs `CONFIG_TYPEC_SN201202X=m` or the ports stay in gadget mode until that module is loaded and the cable is replugged.
 
 ### Installer
 

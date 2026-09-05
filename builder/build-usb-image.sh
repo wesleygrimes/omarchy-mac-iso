@@ -29,20 +29,27 @@ else
 fi
 [[ -n $host_vmlinuz ]] \
   || fail "no host linux-asahi vmlinuz (tried /boot/vmlinuz-linux-asahi and /boot/EFI/omarchy/vmlinuz)"
-# M3 DCP needs appledrm V14_7 (>= asahi-wip-7.2). 7.1.6 falls back to simpledrm.
+# M3 DCP needs appledrm v14.7 (>= asahi-wip-7.2). 7.1.6 falls back to simpledrm.
+# The 7.2 module spells it iomfb_*_v14_7_0, not V14_7. grep -a on the .ko —
+# `strings | grep -q` under pipefail exits 141 (SIGPIPE) on a match.
 appledrm_ko=""
-for f in /usr/lib/modules/"$kver"/kernel/drivers/gpu/drm/apple/appledrm.ko*; do
+moddir=${OMARCHY_MODULES_DIR:-/usr/lib/modules/$kver}
+for f in "$moddir"/kernel/drivers/gpu/drm/apple/appledrm.ko*; do
   [[ -f $f ]] || continue
   appledrm_ko=$f
   break
 done
-if [[ -n $appledrm_ko ]] && ! strings "$appledrm_ko" | grep -q V14_7; then
+if [[ -z $appledrm_ko ]]; then
+  fail "no appledrm.ko under $moddir (set OMARCHY_MODULES_DIR / OMARCHY_KVER)"
+fi
+if ! grep -aqi 'v14_7' "$appledrm_ko"; then
   if [[ ${OMARCHY_ALLOW_OLD_APPLEDRM:-} == 1 ]]; then
-    log "warning: $kver appledrm has no V14_7 — M3 will stay on simpledrm"
+    log "warning: $kver appledrm has no v14.7 — M3 will stay on simpledrm"
   else
-    fail "$kver appledrm has no V14_7 (need linux-asahi >= 7.2 for M3 DCP). Build on a 7.2 host, or set OMARCHY_KVER/OMARCHY_VMLINUZ, or OMARCHY_ALLOW_OLD_APPLEDRM=1 for a simpledrm image"
+    fail "$kver appledrm ($appledrm_ko) has no v14.7 (need linux-asahi >= 7.2 for M3 DCP). Build on a 7.2 host, or set OMARCHY_KVER/OMARCHY_VMLINUZ/OMARCHY_MODULES_DIR, or OMARCHY_ALLOW_OLD_APPLEDRM=1 for a simpledrm image"
   fi
 fi
+log "appledrm $appledrm_ko (v14.7 ok)"
 command -v mkinitcpio >/dev/null || fail "mkinitcpio not found (pacman -S mkinitcpio)"
 command -v grub-mkstandalone >/dev/null || fail "grub-mkstandalone not found (pacman -S grub)"
 command -v mkfs.vfat >/dev/null || fail "mkfs.vfat not found (pacman -S dosfstools)"
@@ -113,6 +120,14 @@ mkinitcpio -n \
   "${mkinitcpio_dirs[@]}" \
   -k "$kver" \
   -g "$work/initramfs-linux-asahi-plain.img"
+
+# kms uses find() on /lib/modules/$kver, which does not follow a modules-dir
+# symlink (OMARCHY_MODULES_DIR). Name appledrm in MODULES so Plymouth/DCP
+# still get the 7.2 driver when the host is 7.1.6 with a side-loaded tree.
+for img in "$work/initramfs-linux-asahi.img" "$work/initramfs-linux-asahi-plain.img"; do
+  lsinitcpio "$img" | grep -q 'appledrm\.ko' \
+    || fail "$(basename "$img") missing appledrm.ko (set OMARCHY_KVER / OMARCHY_MODULES_DIR, and keep appledrm in the install mkinitcpio MODULES)"
+done
 
 log "Building standalone GRUB"
 grub-mkstandalone -O arm64-efi \

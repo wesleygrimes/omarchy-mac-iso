@@ -328,7 +328,7 @@ ask_desktop_user() {
   done
   ask_hostname
   ask_git_identity
-  ask_timezone
+  desktop_timezone=UTC
 }
 
 # Same rules as install/provisioning/setup-form.sh. Empty → omarchy.
@@ -364,24 +364,6 @@ ask_git_identity() {
   desktop_email=$email
 }
 
-# Same as omarchy_prompt_timezone. Empty / cancel keeps UTC (image default).
-ask_timezone() {
-  local guess tz
-  if [[ ${OMARCHY_INSTALL_DRY_RUN:-} == 1 ]]; then
-    desktop_timezone=${desktop_timezone:-UTC}
-    return 0
-  fi
-  guess=$(tzupdate -p 2>/dev/null || true)
-  if [[ -n $guess ]]; then
-    tz=$(timedatectl list-timezones | gum choose --height 10 --selected "$guess" \
-      --header "Timezone (Esc keeps UTC)") || tz=""
-  else
-    tz=$(timedatectl list-timezones | gum filter --height 10 \
-      --header "Timezone (Esc keeps UTC)") || tz=""
-  fi
-  desktop_timezone=${tz:-UTC}
-}
-
 write_installed_hostname() {
   local root_mnt=$1
   printf '%s\n' "$desktop_hostname" >"$root_mnt/etc/hostname"
@@ -415,6 +397,16 @@ ask_encrypt_root() {
     encrypt_root=1
     command -v cryptsetup >/dev/null \
       || fail "cryptsetup not found — rebuild with --usb --rootfs"
+    ensure_dm_crypt
+  fi
+}
+
+# Live initrd has no dm-crypt (no encrypt hook). The payload must provide
+# the .ko. A dangling /usr/lib/modules/$kver symlink looks like "Invalid argument".
+ensure_dm_crypt() {
+  modprobe dm-mod 2>/dev/null || true
+  if ! modprobe dm-crypt; then
+    fail "dm-crypt would not load for $(uname -r). Check /usr/lib/modules/$(uname -r) (must be a real tree, not a symlink to the builder)"
   fi
 }
 
@@ -433,16 +425,15 @@ confirm_install_choices() {
     name_label=${desktop_full_name:-"(skipped)"}
     email_label=${desktop_email:-"(skipped)"}
     echo
-    printf 'Field,Value\nAction,%s\nTarget,%s\nUsername,%s\nPassword,%s\nFull name,%s\nEmail,%s\nHostname,%s\nTimezone,%s\nEncryption,%s\n' \
+    printf 'Field,Value\nAction,%s\nTarget,%s\nUsername,%s\nPassword,%s\nFull name,%s\nEmail,%s\nHostname,%s\nEncryption,%s\n' \
       "$action_label" "$target_label" "$desktop_user" "$stars" \
-      "$name_label" "$email_label" "$desktop_hostname" \
-      "${desktop_timezone:-UTC}" "$encrypt_label" |
+      "$name_label" "$email_label" "$desktop_hostname" "$encrypt_label" |
       gum table -s "," -p
     echo
     if [[ ${OMARCHY_INSTALL_DRY_RUN:-} == 1 ]]; then
-      printf 'dry-run: Does this look right? user=%s name=%s email=%s host=%s tz=%s encrypt=%s target=%s\n' \
+      printf 'dry-run: Does this look right? user=%s name=%s email=%s host=%s encrypt=%s target=%s\n' \
         "$desktop_user" "$name_label" "$email_label" "$desktop_hostname" \
-        "${desktop_timezone:-UTC}" "$encrypt_label" "$target_label"
+        "$encrypt_label" "$target_label"
       return 0
     fi
     if gum confirm --affirmative "Yes, install" --negative "No, change it" \
@@ -659,7 +650,7 @@ seed_no_hardware_cursors() {
   local root_mnt=$1 user=$2
   local dt=/sys/firmware/devicetree/base/compatible
   local look=$root_mnt/home/$user/.config/hypr/looknfeel.lua
-  grep -aq 'apple,t8122' "$dt" 2>/dev/null || return 0
+  grep -aqE 'apple,t8122|apple,t6030|apple,t6031|apple,t6032|apple,t6034' "$dt" 2>/dev/null || return 0
   if [[ ${OMARCHY_INSTALL_DRY_RUN:-} == 1 ]]; then
     printf 'dry-run: Hyprland cursor.no_hardware_cursors for %s\n' "$user"
     return 0
@@ -787,8 +778,9 @@ personalize_graphical_session() {
     mount -o subvol=@home "$root_part" "$root_mnt/home"
     home_mounted=1
   fi
+  groupadd --root "$root_mnt" -f bluetooth
   useradd --root "$root_mnt" -m -s /bin/bash \
-    -G wheel,video,audio,input,render "$user"
+    -G wheel,video,audio,input,render,bluetooth "$user"
   # Same password for the desktop user and root, matching the x86 ISO
   # setup form ("user + root"). If sudo is missing, su still works.
   printf '%s:%s\n' "$user" "$pass" | chpasswd --root "$root_mnt"
@@ -887,8 +879,12 @@ install_persistent_root() {
   root_dev=$root_part
   if (( encrypt_root == 1 )); then
     printf '==> luksFormat %s\n' "$root_part"
-    printf '%s' "$desktop_pass" | cryptsetup luksFormat --type luks2 --label OMARCHYROOT --batch-mode --key-file=- "$root_part"
-    printf '%s' "$desktop_pass" | cryptsetup open --key-file=- "$root_part" root
+    ensure_dm_crypt
+    printf '%s' "$desktop_pass" | cryptsetup luksFormat --type luks2 --label OMARCHYROOT --batch-mode --key-file=- "$root_part" \
+      || fail "luksFormat $root_part failed"
+    cryptsetup close root 2>/dev/null || true
+    printf '%s' "$desktop_pass" | cryptsetup open --key-file=- "$root_part" root \
+      || fail "cryptsetup open $root_part as root failed"
     root_dev=/dev/mapper/root
     luks_uuid=$(blkid -s UUID -o value "$root_part")
     [[ -n $luks_uuid ]] || fail "no UUID on LUKS container $root_part"
@@ -1214,8 +1210,12 @@ install_into_free_space() {
   root_dev=$root_part
   if (( encrypt_root == 1 )); then
     printf '==> luksFormat %s\n' "$root_part"
-    printf '%s' "$desktop_pass" | cryptsetup luksFormat --type luks2 --label OMARCHYROOT --batch-mode --key-file=- "$root_part"
-    printf '%s' "$desktop_pass" | cryptsetup open --key-file=- "$root_part" root
+    ensure_dm_crypt
+    printf '%s' "$desktop_pass" | cryptsetup luksFormat --type luks2 --label OMARCHYROOT --batch-mode --key-file=- "$root_part" \
+      || fail "luksFormat $root_part failed"
+    cryptsetup close root 2>/dev/null || true
+    printf '%s' "$desktop_pass" | cryptsetup open --key-file=- "$root_part" root \
+      || fail "cryptsetup open $root_part as root failed"
     root_dev=/dev/mapper/root
     luks_uuid=$(blkid -s UUID -o value "$root_part")
     [[ -n $luks_uuid ]] || fail "no UUID on LUKS container $root_part"
@@ -1370,8 +1370,12 @@ install_over_existing_root() {
   root_dev=$root_part
   if (( encrypt_root == 1 )); then
     printf '==> luksFormat %s\n' "$root_part"
-    printf '%s' "$desktop_pass" | cryptsetup luksFormat --type luks2 --label OMARCHYROOT --batch-mode --key-file=- "$root_part"
-    printf '%s' "$desktop_pass" | cryptsetup open --key-file=- "$root_part" root
+    ensure_dm_crypt
+    printf '%s' "$desktop_pass" | cryptsetup luksFormat --type luks2 --label OMARCHYROOT --batch-mode --key-file=- "$root_part" \
+      || fail "luksFormat $root_part failed"
+    cryptsetup close root 2>/dev/null || true
+    printf '%s' "$desktop_pass" | cryptsetup open --key-file=- "$root_part" root \
+      || fail "cryptsetup open $root_part as root failed"
     root_dev=/dev/mapper/root
     luks_uuid=$(blkid -s UUID -o value "$root_part")
     [[ -n $luks_uuid ]] || fail "no UUID on LUKS container $root_part"

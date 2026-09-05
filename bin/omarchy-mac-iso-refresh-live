@@ -107,6 +107,13 @@ if [[ -n $live ]]; then
     "$mnt/usr/local/sbin/omarchy-mac-patch-j613-dcp"
   install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-patch-j613-dcp" \
     "$share/omarchy-mac-patch-j613-dcp"
+  install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-dump-board" \
+    "$mnt/usr/local/sbin/omarchy-mac-dump-board"
+  install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-bluetooth-firmware" \
+    "$mnt/usr/local/sbin/omarchy-mac-bluetooth-firmware"
+  install -m644 "$repo_root/configs/usb/rootfs/omarchy-mac-bluetooth-firmware.service" \
+    "$mnt/etc/systemd/system/omarchy-mac-bluetooth-firmware.service"
+  systemctl --root="$mnt" enable omarchy-mac-bluetooth-firmware.service
   install -d "$share/m1n1"
   install -m644 "$repo_root/configs/m1n1/j613-dcp-overlay.dts" "$share/m1n1/j613-dcp-overlay.dts"
   install -m644 "$repo_root/configs/m1n1/j613-dcp.dtbo" "$share/m1n1/j613-dcp.dtbo"

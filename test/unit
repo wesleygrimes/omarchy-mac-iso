@@ -53,6 +53,15 @@ check "omarchy-mac-iso-boot --help works offline" "${repo_root}/bin/omarchy-mac-
 check "usb grub.cfg finds initramfs-omarchy-usb.img" \
   grep -q initramfs-omarchy-usb.img "${repo_root}/configs/usb/grub.cfg"
 check "usb mkinitcpio lists dwc3_apple" grep -q dwc3_apple "${repo_root}/configs/usb-initcpio/mkinitcpio.conf"
+check "live initrd MODULES include sn201202x" grep -qE \
+  '^[[:space:]]*sn201202x\??$' \
+  "${repo_root}/configs/usb-initcpio/mkinitcpio.conf"
+check "LUKS install initrd MODULES include sn201202x" grep -qE \
+  '^[[:space:]]*sn201202x\??$' \
+  "${repo_root}/configs/usb-initcpio/mkinitcpio-install.conf"
+check "plain install initrd MODULES include sn201202x" grep -qE \
+  '^[[:space:]]*sn201202x\??$' \
+  "${repo_root}/configs/usb-initcpio/mkinitcpio-install-plain.conf"
 check "sh -n live-init" sh -n "${repo_root}/configs/usb/live-init"
 check "live-init sets PATH to /bin" grep -q 'PATH=/bin' "${repo_root}/configs/usb/live-init"
 check "usb hook execs switch_root" grep -q 'exec switch_root' \
@@ -302,6 +311,14 @@ check "consume finds leftover OMARCHYLIVE if GPT name is empty" grep -q \
 check "consume walks LUKS via dm slaves not lsblk PKNAME" grep -q \
   '/sys/class/block/$kname/slaves' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-consume-installer"
+check "consume grows LUKS without a passphrase prompt" grep -q \
+  'dmsetup table --showkeys' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-consume-installer"
+check "consume does not deadlock root with dmsetup suspend" \
+  bash -c '! grep -q "dmsetup suspend" "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-consume-installer"'
+check "consume loads a longer live dm table then resumes" grep -q \
+  'dmsetup load' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-consume-installer"
 check "macos placer falls back when gpt label is EPERM" grep -q \
   'live TUI will name the slice' \
   "${repo_root}/scripts/macos/place-nvme-installer.sh"
@@ -372,25 +389,94 @@ check "unencrypted install initrd has no encrypt hook" \
   bash -c '! grep -E "^HOOKS=.*encrypt" "'"${repo_root}"'/configs/usb-initcpio/mkinitcpio-install-plain.conf"'
 check "LUKS install initrd still has encrypt" grep -q encrypt \
   "${repo_root}/configs/usb-initcpio/mkinitcpio-install.conf"
+check "LUKS initrd wraps cryptsetup with disable-keyring" grep -q \
+  omarchy-crypt-nokeyring \
+  "${repo_root}/configs/usb-initcpio/mkinitcpio-install.conf"
+check "live initrd does not wrap cryptsetup" \
+  bash -c '! grep -q omarchy-crypt-nokeyring "'"${repo_root}"'/configs/usb-initcpio/mkinitcpio.conf"'
+check "bash -n omarchy-crypt-nokeyring" bash -n \
+  "${repo_root}/configs/usb-initcpio/install/omarchy-crypt-nokeyring"
+check "cryptsetup wrapper passes --disable-keyring" grep -qF -- \
+  '--disable-keyring' \
+  "${repo_root}/configs/usb-initcpio/install/omarchy-crypt-nokeyring"
+check "LUKS install initrd MODULES include appledrm" grep -qE \
+  '^[[:space:]]*appledrm$' \
+  "${repo_root}/configs/usb-initcpio/mkinitcpio-install.conf"
+check "plain install initrd MODULES include appledrm" grep -qE \
+  '^[[:space:]]*appledrm$' \
+  "${repo_root}/configs/usb-initcpio/mkinitcpio-install-plain.conf"
 check "usb image builds the plain install initrd" grep -q \
   initramfs-linux-asahi-plain.img \
   "${repo_root}/builder/build-usb-image.sh"
 check "unencrypted ESP copy prefers the plain initrd" grep -q \
   initramfs-linux-asahi-plain.img \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-esp.sh"
-check "usb image refuses 7.1 appledrm without V14_7" grep -q \
-  V14_7 \
+check "usb image refuses 7.1 appledrm without v14.7" grep -q \
+  "grep -aqi 'v14_7'" \
+  "${repo_root}/builder/build-usb-image.sh"
+check "usb image fails if the install initrd lacks appledrm" grep -q \
+  'missing appledrm.ko' \
   "${repo_root}/builder/build-usb-image.sh"
 check "rootfs extra packages include dtc" grep -qx dtc \
   "${repo_root}/configs/usb/rootfs/packages"
 check "installer seeds no_hardware_cursors on t8122" grep -q \
   no_hardware_cursors \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "installer seeds no_hardware_cursors on M3 Pro/Max" grep -q \
+  'apple,t6030' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "installer patches j613 m1n1 after ESP hashes" grep -q \
   omarchy-mac-patch-j613-dcp \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "bash -n omarchy-mac-patch-j613-dcp" bash -n \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-patch-j613-dcp"
+check "bash -n omarchy-mac-dump-board" bash -n \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-dump-board"
+check "dump-board is read-only of m1n1" \
+  bash -c '! grep -qE "patch_boot_bin|--write" "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-dump-board"'
+check "dump-board does not touch vendorfw" \
+  bash -c '! grep -q vendorfw "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-dump-board"'
+check "dump-board does not mklabel" \
+  bash -c '! grep -q mklabel "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-dump-board"'
+check "rootfs installs dump-board" grep -q omarchy-mac-dump-board \
+  "${repo_root}/builder/build-rootfs.sh"
+check "refresh-live copies dump-board" grep -q omarchy-mac-dump-board \
+  "${repo_root}/bin/omarchy-mac-iso-refresh-live"
+check "bash -n omarchy-mac-bluetooth-firmware" bash -n \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-bluetooth-firmware"
+check "bluetooth firmware aliases -u to -a without writing vendorfw" \
+  bash -c '
+    set -euo pipefail
+    tmp=$(mktemp -d)
+    trap "rm -rf \"$tmp\"" EXIT
+    mkdir -p "$tmp/vendor" "$tmp/alias"
+    : >"$tmp/vendor/brcmbt4388c0-apple,dnieper-u.bin"
+    : >"$tmp/vendor/brcmbt4388c0-apple,dnieper-u.ptb"
+    OMARCHY_BRCM_VENDOR="$tmp/vendor" OMARCHY_BRCM_ALIAS_DIR="$tmp/alias" \
+      OMARCHY_SKIP_REBIND=1 \
+      "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-bluetooth-firmware"
+    [[ -L $tmp/alias/brcmbt4388c0-apple,dnieper-a.bin ]]
+    [[ -L $tmp/alias/brcmbt4388c0-apple,dnieper-a.ptb ]]
+    [[ ! -e $tmp/vendor/brcmbt4388c0-apple,dnieper-a.bin ]]
+  '
+check "bluetooth firmware unit runs the alias script" grep -q \
+  ExecStart=/usr/local/sbin/omarchy-mac-bluetooth-firmware \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-bluetooth-firmware.service"
+check "rootfs installs bluetooth firmware aliases" grep -q \
+  omarchy-mac-bluetooth-firmware \
+  "${repo_root}/builder/build-rootfs.sh"
+check "rootfs enables bluetooth firmware aliases" grep -q \
+  'enable omarchy-mac-bluetooth-firmware.service' \
+  "${repo_root}/builder/build-rootfs.sh"
+check "refresh-live copies bluetooth firmware aliases" grep -q \
+  omarchy-mac-bluetooth-firmware \
+  "${repo_root}/bin/omarchy-mac-iso-refresh-live"
+check "installer adds the desktop user to bluetooth" grep -q \
+  'wheel,video,audio,input,render,bluetooth' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "installer creates the bluetooth group" grep -q \
+  'groupadd --root "$root_mnt" -f bluetooth' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "rootfs copies the j613 DCP dtbo" grep -q j613-dcp.dtbo \
   "${repo_root}/builder/build-rootfs.sh"
 check "installer seeds mkinitcpio.conf for alt-bootloaders" grep -q \
@@ -556,7 +642,7 @@ check "usb-wait prefers cryptdevice UUID over root UUID" grep -q \
   'omarchy-usb-wait: cryptdevice UUID=' \
   "${repo_root}/configs/usb-initcpio/hooks/omarchy-usb-wait"
 check "install initramfs runs encrypt after the USB wait" grep -q \
-  'omarchy-usb-wait encrypt filesystems' \
+  'omarchy-usb-wait encrypt omarchy-crypt-nokeyring filesystems' \
   "${repo_root}/configs/usb-initcpio/mkinitcpio-install.conf"
 check "install initramfs starts plymouth before encrypt" grep -q \
   'plymouth omarchy-usb-wait encrypt' \
@@ -574,10 +660,10 @@ check "installed GRUB offers a verbose boot entry" grep -q \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-esp.sh"
 check "installed GRUB verbose is not a submenu" \
   bash -c '! grep -q submenu "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-esp.sh"'
-check "install asks for a timezone" grep -q ask_timezone \
-  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
-check "install writes /etc/localtime from the timezone choice" grep -q \
-  'usr/share/zoneinfo' \
+check "install does not ask for a timezone" \
+  bash -c '! grep -q ask_timezone "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-install"'
+check "install leaves UTC for first-boot timezone toast" grep -q \
+  'desktop_timezone=UTC' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "piggyback rewrites leftover EFI/omarchy linux lines" grep -q \
   'linux /EFI/omarchy/vmlinuz' \
@@ -607,12 +693,39 @@ check "replace existing says when no Omarchy root exists" grep -q \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "rootfs extra packages include cryptsetup" grep -qx cryptsetup \
   "${repo_root}/configs/usb/rootfs/packages"
+check "rootfs copies modules from a real path not a symlink" grep -q \
+  'readlink -f' \
+  "${repo_root}/builder/build-rootfs.sh"
+check "rootfs refuses a modules-dir symlink in the payload" grep -q \
+  'still a symlink' \
+  "${repo_root}/builder/build-rootfs.sh"
+check "rootfs copied modules include dm-crypt.ko" grep -q \
+  'dm-crypt.ko' \
+  "${repo_root}/builder/build-rootfs.sh"
+check "installer loads dm-crypt before luksFormat" grep -q \
+  ensure_dm_crypt \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "live initrd MODULES include dm-crypt" grep -qE \
+  '^[[:space:]]*dm-crypt$' \
+  "${repo_root}/configs/usb-initcpio/mkinitcpio.conf"
 check "install initramfs lists dwc3_apple" grep -q dwc3_apple \
   "${repo_root}/configs/usb-initcpio/mkinitcpio-install.conf"
 check "sh -n omarchy-usb-wait" sh -n \
   "${repo_root}/configs/usb-initcpio/hooks/omarchy-usb-wait"
 check "rootfs pacstraps dosfstools and grub" grep -q dosfstools \
   "${repo_root}/builder/build-rootfs.sh"
+check "rootfs pins cached aquamarine when extra soname is ahead" grep -q \
+  pin_aquamarine_if_soname_skew \
+  "${repo_root}/builder/build-rootfs.sh"
+check "rootfs puts IgnorePkg under options with awk" grep -q \
+  write_ignorepkg \
+  "${repo_root}/builder/build-rootfs.sh"
+check "rootfs installs pinned aquamarine with pacman -U" grep -q \
+  'pacman -U --noconfirm --root "$mnt"' \
+  "${repo_root}/builder/build-rootfs.sh"
+check "rootfs never pacstraps the aquamarine tarball" bash -c \
+  '! grep aquamarine_pin "${1}" | grep -q pacstrap' \
+  -- "${repo_root}/builder/build-rootfs.sh"
 check "usb image embeds grub-embed.cfg" grep -q grub-embed.cfg \
   "${repo_root}/builder/build-usb-image.sh"
 check "usb image builds install initramfs" grep -q initramfs-linux-asahi.img \
