@@ -1,12 +1,14 @@
 # Omarchy Mac ISO
 
-Install images for Omarchy on Apple Silicon. The shipped artifact is a GPT disk image (`.img`) with a FAT32 ESP, not an ISO9660 file — the repo name matches Omarchy's x86 ISO so people can find it.
+Live and installer artifacts for Omarchy on Apple Silicon. The default build is an NVMe-installer file set; an optional flashable USB artifact is a GPT disk image (`.img`) with a FAT32 ESP, not an ISO9660 file. The repo name matches Omarchy's x86 ISO so people can find it.
 
 This repo owns the live USB and installer. [omarchy-mac](https://github.com/omarchy-mac/omarchy-mac) owns the installed desktop. Destination design: [plans/apple-silicon-image.md](plans/apple-silicon-image.md). How to work in this tree: [AGENTS.md](AGENTS.md).
 
 Default branch is `main`. That is unrelated to `omarchy-mac`'s `main` (still v3.x); this tree has no v3 history.
 
 A Mac with no Asahi/m1n1 cannot boot this USB. iBoot will not load it until macOS has run the Asahi **UEFI-only** provision. Shrink APFS from macOS, never from Linux.
+
+The installer is Apple-Silicon-wide; it is not restricted to M3. M1 and M2 use the kernel/device-tree support supplied by Asahi. The `apple,j613` patch is a guarded enhancement for full-resolution display on the 13-inch M3 Air and exits without changing `boot.bin` on every other board. Current metal proof is strongest on that M3 Air, so other models remain validation targets rather than implied guarantees.
 
 ## USB image (Apple Silicon host)
 
@@ -16,11 +18,20 @@ On a machine that already runs `linux-asahi`:
 sudo ./bin/omarchy-mac-iso-make --usb --rootfs
 ```
 
-Writes `release/omarchy-mac-iso-usb/` — GPT image plus the files the NVMe placer copies:
+Writes `release/omarchy-mac-iso-usb/` — the files the NVMe placer copies (`payload.img`, `vmlinuz-linux-asahi`, the live, encrypted-install, and plain-install initrds, `BOOTAA64-NVME.EFI`, `grub-nvme-installer.cfg`). It does **not** wrap `omarchy-mac-usb.img` unless you also pass `--disk-image`.
 
-- `omarchy-mac-usb.img` — GPT with ESP labelled `OMARCHYISO` (standalone GRUB, this host's `linux-asahi`, live initrd `initramfs-omarchy-usb.img`, install initrd `initramfs-linux-asahi.img`) and btrfs labelled `OMARCHYLIVE`, subvol `@`
-- `payload.img` — that btrfs partition alone (what macOS `dd`s onto `omarchy-install`). **Not** the full GPT image
-- `vmlinuz-linux-asahi`, both initrds, `BOOTAA64.EFI`, `grub-nvme-installer.cfg`
+Every build writes `BUILD_INFO` with the full source commit, dirty/clean state, kernel version, and optional `OMARCHY_KERNEL_SOURCE_REF`, plus `SHA256SUMS` for the generated files. To make a self-contained tester directory without manually copying stale files:
+
+```
+./bin/omarchy-mac-iso-package-tester-drop \
+  release/omarchy-mac-iso-usb \
+  release/omarchy-mac-apple-silicon-preview-1
+```
+
+The destination must not already exist. The packager verifies the build manifest, compresses the payload, copies the current instructions and collectors, and generates a new manifest for the complete drop.
+
+- `payload.img` — btrfs labelled `OMARCHYLIVE`, subvol `@` (what macOS `dd`s onto `omarchy-install`)
+- `omarchy-mac-usb.img` — only with `--disk-image`: GPT ESP `OMARCHYISO` + that payload, for `dd` onto a USB stick. Never onto the internal SSD
 
 Live session is tty autologin (`multi-user.target`), not a graphical login. Default payload is 12GiB with zstd; a 16GB stick is the floor. Override with `OMARCHY_USB_PAYLOAD_BYTES`.
 
@@ -30,9 +41,10 @@ Needs root, `arch-install-scripts`, a sibling `omarchy-mac` checkout (or `OMARCH
 
 `--usb` without `--rootfs` still writes a tiny busybox payload and is not the installer. Override payload size with `OMARCHY_USB_PAYLOAD_BYTES`; package search with `OMARCHY_LOCAL_PACKAGES`.
 
-Flash (destroys the target stick):
+Optional USB stick image (destroys the target stick):
 
 ```
+sudo ./bin/omarchy-mac-iso-make --usb --rootfs --disk-image
 sudo dd if=release/omarchy-mac-iso-usb/omarchy-mac-usb.img of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
@@ -42,7 +54,7 @@ Copying files onto an existing FAT stick is not enough — the payload is its ow
 
 M3 Type-C often never appears in U-Boot. After Asahi **UEFI-only** (M3: `EXPERT=true` and `curl -L https://alx.sh/dev | sh`, firmware 14.8.3), you need an **unallocated** GPT hole (shrink APFS from macOS, or `diskutil eraseVolume free none` on an existing Linux slice only — never APFS / Recovery / the `m1n1` ESP). Hole size should be about **twice** the payload (copy + installer) plus slack.
 
-Copy `payload.img`, the two initrds, `vmlinuz-linux-asahi`, `BOOTAA64.EFI`, and `grub-nvme-installer.cfg` onto the Mac, plus `scripts/macos/place-nvme-installer.sh`. Do **not** `dd` `omarchy-mac-usb.img` onto the internal disk.
+Copy `payload.img`, all three initrds, `vmlinuz-linux-asahi`, `BOOTAA64-NVME.EFI`, and `grub-nvme-installer.cfg` onto the Mac, plus `scripts/macos/place-nvme-installer.sh`. Do **not** `dd` `omarchy-mac-usb.img` onto the internal disk.
 
 ```
 # Dry-run first. --confirm writes.
@@ -51,7 +63,7 @@ sudo ./place-nvme-installer.sh \
   --esp-files .
 ```
 
-On the internal SSD, `gpt add` / `gpt label` are **EPERM** while macOS is booted. The placer uses 4K native sectors, then `diskutil addPartition` a placeholder (the leading hole) + `omarchy-install` at the tail, then `eraseVolume free none` on the placeholder. `dd` is only onto the new `rdisk0sN`. Live GRUB is copied next to `m1n1/` (`m1n1` / `vendorfw` / `asahi` hashes must match).
+On the internal SSD, `gpt add` / `gpt label` are **EPERM** while macOS is booted. The placer uses 4K native sectors, then `diskutil addPartition` a placeholder (the leading hole) + `omarchy-install` at the tail, then `eraseVolume free none` on the placeholder. `dd` is only onto the new `rdisk0sN`. Before changing the GPT it verifies that the ESP has room for every temporary file plus write slack. NVMe live boot has its own EFI embed, `/omarchy-nvme-live` marker, and `grub/grub-nvme.cfg`; it cannot select a plugged-in USB's marker or config. Its temporary kernel and initrds use `*-omarchy-nvme-*` names, so an existing install's standard `/vmlinuz-linux-asahi` and `/initramfs-linux-asahi.img` remain byte-for-byte untouched. `m1n1` / `vendorfw` / `asahi` hashes must match.
 
 macOS leaves the GPT **name** empty. The live TUI names the NVMe payload `omarchy-install` (needed for own-mode GRUB and consume). Cold power on, **Install into free space** into the hole in front of that slice, not replace-existing. First boot of the new root deletes **only** `omarchy-install` and grows.
 
@@ -93,12 +105,18 @@ It asks for a username, password (re-prompts on mismatch), hostname (empty → `
 | Action | What it does |
 |--------|----------------|
 | **Install into free space** | `parted mkpart` in an existing GPT hole only. APFS/iBoot/Recovery stay. Needs unallocated space (macOS APFS shrink, Asahi UEFI-only leftover, or the hole in front of an `omarchy-install` slice) |
-| **Reinstall an existing Omarchy root** | Formats that partition only — no `mkpart`, no `mklabel`. Finds btrfs `OMARCHYROOT` or a LUKS volume labelled `OMARCHYROOT` / GPT name `root`. Does not offer Asahi's own LUKS |
+| **Reinstall an existing Omarchy root** | Formats that partition only — no `mkpart`, no `mklabel`. Finds btrfs `OMARCHYROOT` or a LUKS volume labelled `OMARCHYROOT` / GPT name `root`. Does not offer Asahi's own LUKS. Disabled while running from the temporary NVMe `omarchy-install` slice |
 | **Wipe a USB stick and install** | GPT ESP (`OMARCHYBOOT`) + root filling the stick. Persistent desktop, no overlay |
-| **Write GRUB for an existing Omarchy root** | Bootloader only. Skips encrypted roots (needs the inner UUID) |
+| **Write GRUB for an existing Omarchy root** | Bootloader only. Skips encrypted roots (needs the inner UUID). Disabled while running from the temporary NVMe `omarchy-install` slice |
 | **Clone** | `dd` through the last partition onto another stick; rewrites the clone btrfs UUID |
 
 Wipe, free-space, and replace **copy used files** (`tar` of the overlay lowerdir onto a fresh btrfs `@` / `@home` / `@log`). They do not `dd` the payload. After the copy the installer runs `omarchy-apply-system --first-install` and `omarchy-provision-user --first-install` in the target (same as `omarchy-mac/install.sh`). First graphical login still runs `omarchy-provision-first-run` for the welcome / timezone / Wi-Fi / update toasts. Clone is still a block copy.
+
+Multiple Omarchy roots can coexist. Each root UUID gets its own `EFI/omarchy/<root-uuid>/` kernel/initramfs pair and `grub/omarchy-roots/<root-uuid>.cfg` menu fragment. Only UUID-named fragments are assembled into `grub/omarchy.cfg`; `grub/custom.cfg` sources that managed file, so a later `grub-mkconfig` by the GRUB-owning installation retains the additional roots. Installing into a second free-space hole preserves the original root as the default. Shared-ESP roots mount the full ESP at `/boot/efi`, not `/boot`, preventing their future kernel tools from overwriting another root's standard `/boot` files. Reinstall replaces the selected root only.
+
+The macOS NVMe placer does not copy or parse an existing `grub-mkconfig` output. It leaves `grub/grub.cfg` and `grub/custom.cfg` in place, saves the owning `BOOTAA64.EFI`, and temporarily installs the dedicated NVMe-live EFI executable. During installation it restores the saved executable and piggybacks the new UUID entry through `custom.cfg`, leaving the existing `omarchy-mac` menu and default logic under their original owner's control. If the UEFI-only ESP had no prior bootloader, the installer instead creates an owned GRUB using only its generated UUID fragments. Private NVMe files are removed only when that same-ESP placement is successfully consumed; a USB install cannot remove a pending placement.
+
+The placer refuses an ESP containing the previous placer layout (`/omarchy-usb-live` or an NVMe-live title in the owning `grub.cfg`). Do not delete that marker alone: the old placer also replaced bootloader/config files. First restore the intended installed `BOOTAA64.EFI` and GRUB configuration from a known ESP backup, verify that installation boots, then remove the obsolete live marker and retry.
 
 LUKS is offered on wipe, free-space, and replace. New containers get label `OMARCHYROOT`. Install initrd runs Plymouth before `encrypt` so there is one branded unlock, not a text prompt then Plymouth.
 
@@ -106,10 +124,12 @@ LUKS is offered on wipe, free-space, and replace. New containers get label `OMAR
 
 Never `mkfs` of the ESP, never `update-m1n1`:
 
-- **Piggyback** — some other OS already owns `BOOTAA64.EFI`: write `grub/custom.cfg` only, leave the file bytes unchanged
-- **Own** — UEFI-only ESP with no GRUB, **or** this NVMe live installer wrote `BOOTAA64.EFI`: write `BOOTAA64.EFI` and marker `/omarchy-mac-root`. Do not piggyback the live menu; this GRUB embed does not show `custom.cfg` entries (M3 Air: only “NVMe installer” appeared until `grub.cfg` listed the new root first)
+- **Piggyback** — some other OS owns GRUB, including after restoring the executable temporarily replaced by NVMe live boot: preserve its `grub.cfg` and existing `custom.cfg`, then add one `source /grub/omarchy.cfg` include
+- **Own** — UEFI-only ESP with no pre-existing bootloader: atomically write an installer-owned `BOOTAA64.EFI`, `grub.cfg`, and marker `/omarchy-mac-root`
 
-Kernels live under `EFI/omarchy/` so a later `grub-mkconfig` on that ESP does not pick them up as stray entries. Backups of `BOOTAA64.EFI` / `grub.cfg` / `custom.cfg` are `*.omarchy-bak` on the ESP. `m1n1/` / `vendorfw/` / `asahi/` hashes must match after, except the j613 DTB slot in `m1n1/boot.bin`.
+Kernels live under `EFI/omarchy/<root-uuid>/` so a later `grub-mkconfig` on that ESP does not pick them up as stray entries and one root cannot overwrite another root's initrd. Backups of `BOOTAA64.EFI` / `grub.cfg` / `custom.cfg` are `*.omarchy-bak` on the ESP. `m1n1/` / `vendorfw/` / `asahi/` hashes must match after, except the j613 DTB slot in `m1n1/boot.bin`.
+
+Current limitation: ISO-installed roots deliberately ship no `linux-asahi` package or private-directory update hook, so their UUID-private kernel/initramfs remain at the installer version. Do not install/update a kernel until a hook exists to sync it into `EFI/omarchy/<root-uuid>/`. Also do not run `omarchy-system-boot-to-esp` from a shared-ESP ISO root: it would remount the ESP at `/boot` and replace the owning installation's GRUB. Installed shared roots contain `/etc/omarchy-mac-iso-shared-esp` as a warning marker.
 
 ### Wi-Fi on the live USB
 
