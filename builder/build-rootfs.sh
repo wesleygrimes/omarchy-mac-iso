@@ -343,6 +343,17 @@ install -m644 "$repo_root/configs/usb/rootfs/sysctl-quiet-console.conf" \
   "$mnt/etc/sysctl.d/90-omarchy-quiet-console.conf"
 install -d "$mnt/usr/local/sbin"
 install -d "$mnt/usr/local/share/omarchy-mac-iso"
+git_ref=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || printf unknown)
+source_state=clean
+[[ -z $(git -C "$repo_root" status --porcelain --untracked-files=normal 2>/dev/null) ]] \
+  || source_state=dirty
+{
+  printf 'built_utc: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf 'built_from_ref: %s\n' "$git_ref"
+  printf 'source_state: %s\n' "$source_state"
+  printf 'kernel: linux-asahi %s\n' "$kver"
+  printf 'kernel_source_ref: %s\n' "${OMARCHY_KERNEL_SOURCE_REF:-not-recorded}"
+} >"$mnt/etc/omarchy-mac-iso-build"
 install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-install" \
   "$mnt/usr/local/sbin/omarchy-mac-install"
 install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-live-welcome" \
@@ -359,6 +370,8 @@ install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-patch-j613-dcp" \
   "$mnt/usr/local/share/omarchy-mac-iso/omarchy-mac-patch-j613-dcp"
 install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-dump-board" \
   "$mnt/usr/local/sbin/omarchy-mac-dump-board"
+install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-validate" \
+  "$mnt/usr/local/sbin/omarchy-mac-validate"
 install -m755 "$repo_root/configs/usb/rootfs/omarchy-mac-bluetooth-firmware" \
   "$mnt/usr/local/sbin/omarchy-mac-bluetooth-firmware"
 install -m644 "$repo_root/configs/usb/rootfs/omarchy-mac-bluetooth-firmware.service" \
