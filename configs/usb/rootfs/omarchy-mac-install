@@ -988,17 +988,55 @@ EOF
   lsblk -o NAME,SIZE,FSTYPE,LABEL,UUID "$target_dev"
 }
 
+# Check exact source sizes before creating or formatting a root partition.
+# Failure here leaves the GPT and existing filesystems untouched.
+preflight_system_esp_boot_files() {
+  local source_esp=$1 esp_part=$2 luks_uuid=${3:-}
+  local esp_mnt source_mnt
+  local source_mode strict_nvme=0
+  local esp_mounted_by_us=0 source_mounted_by_us=0
+  esp_mnt=$(findmnt -n -o TARGET "$esp_part" || true)
+  if [[ -z $esp_mnt ]]; then
+    esp_mnt=$(mktemp -d)
+    mount -o ro "$esp_part" "$esp_mnt" >/dev/null
+    esp_mounted_by_us=1
+  fi
+  if [[ $source_esp == "$esp_part" ]]; then
+    source_mnt=$esp_mnt
+  else
+    source_mnt=$(findmnt -n -o TARGET "$source_esp" || true)
+    if [[ -z $source_mnt ]]; then
+      source_mnt=$(mktemp -d)
+      mount -o ro "$source_esp" "$source_mnt" >/dev/null
+      source_mounted_by_us=1
+    fi
+  fi
+  source_mode=$(esp_boot_source_mode "$source_mnt" "$esp_mnt") || {
+    (( source_mounted_by_us == 0 )) || { umount "$source_mnt"; rmdir "$source_mnt"; }
+    (( esp_mounted_by_us == 0 )) || { umount "$esp_mnt"; rmdir "$esp_mnt"; }
+    fail "refusing same-ESP boot files without an active NVMe-live placement"
+  }
+  [[ $source_mode != nvme ]] || strict_nvme=1
+  esp_require_kernel_copy_space "$source_mnt" "$esp_mnt" "$luks_uuid" \
+    "$strict_nvme" || {
+      (( source_mounted_by_us == 0 )) || { umount "$source_mnt"; rmdir "$source_mnt"; }
+      (( esp_mounted_by_us == 0 )) || { umount "$esp_mnt"; rmdir "$esp_mnt"; }
+      fail "System ESP lacks space for the selected kernel/initramfs, or the required NVMe-private source files are missing"
+    }
+  (( source_mounted_by_us == 0 )) || { umount "$source_mnt"; rmdir "$source_mnt"; }
+  (( esp_mounted_by_us == 0 )) || { umount "$esp_mnt"; rmdir "$esp_mnt"; }
+}
+
 # Copy unique kernels from the live ESP, then piggyback (existing GRUB)
 # or own (UEFI-only: write BOOTAA64.EFI). Never touches m1n1/vendorfw/asahi.
 # Prints "piggyback" or "own" to stdout. Caller holds the root mount.
 apply_system_esp_bootloader() {
   local esp_part=$1 root_uuid=$2 source_esp=$3 luks_uuid=${4:-}
-  local keep_grub_default=${5:-0}
-  local force_own=${6:-0}
+  local old_root_uuid=${5:-} old_luks_uuid=${6:-}
   local esp_mnt live_esp_mnt
   local esp_mounted_by_us=0 live_esp_mounted_by_us=0
   local before_efi after_efi before_prot after_prot
-  local embed_cfg mode
+  local embed_cfg mode source_mode=external strict_nvme=0 force_own=0
 
   embed_cfg=$SHARE/grub-embed-system.cfg
   [[ -f $embed_cfg ]] || embed_cfg=$here/../grub-embed-system.cfg
@@ -1011,6 +1049,19 @@ apply_system_esp_bootloader() {
     esp_mounted_by_us=1
   fi
   before_prot=$(esp_protected_hashes "$esp_mnt")
+
+  if [[ $source_esp == "$esp_part" ]]; then
+    source_mode=$(esp_boot_source_mode "$esp_mnt" "$esp_mnt") \
+      || fail "same-ESP install is not an active NVMe-live placement; refusing to borrow another OS's /boot files"
+    [[ $source_mode == nvme ]] || fail "unexpected same-ESP boot source mode: $source_mode"
+    strict_nvme=1
+    force_own=1
+    if [[ -f $esp_mnt/grub/omarchy-nvme-had-bootloader ]]; then
+      esp_restore_nvme_preinstall_bootloader "$esp_mnt" \
+        || fail "NVMe placer recorded an existing bootloader but its backup cannot be restored"
+      force_own=0
+    fi
+  fi
   before_efi=$(sha256sum "$esp_mnt/EFI/BOOT/BOOTAA64.EFI" 2>/dev/null || true)
 
   if [[ $source_esp == "$esp_part" ]]; then
@@ -1023,7 +1074,8 @@ apply_system_esp_bootloader() {
       live_esp_mounted_by_us=1
     fi
   fi
-  esp_copy_unique_kernels "$live_esp_mnt" "$esp_mnt" "$luks_uuid" \
+  esp_copy_unique_kernels "$live_esp_mnt" "$esp_mnt" "$root_uuid" "$luks_uuid" \
+    "$strict_nvme" \
     || fail "no vmlinuz/initramfs on live ESP $source_esp"
   if (( live_esp_mounted_by_us == 1 )); then
     umount "$live_esp_mnt"
@@ -1031,7 +1083,8 @@ apply_system_esp_bootloader() {
   fi
 
   if (( force_own == 0 )) && esp_has_bootloader "$esp_mnt"; then
-    write_piggyback_esp_grub "$esp_mnt" "$root_uuid" "$luks_uuid" "$keep_grub_default"
+    write_piggyback_esp_grub "$esp_mnt" "$root_uuid" "$luks_uuid" \
+      "$old_root_uuid" "$old_luks_uuid"
     after_efi=$(sha256sum "$esp_mnt/EFI/BOOT/BOOTAA64.EFI" 2>/dev/null || true)
     [[ $before_efi == "$after_efi" ]] || fail "BOOTAA64.EFI changed — aborting"
     mode=piggyback
@@ -1039,12 +1092,15 @@ apply_system_esp_bootloader() {
     command -v grub-mkstandalone >/dev/null \
       || fail "grub-mkstandalone not found — rebuild with --usb --rootfs (grub)"
     write_owned_esp_grub "$esp_mnt" "$root_uuid" "$embed_cfg" "$luks_uuid" \
-      || fail "could not write System ESP GRUB"
+      "$old_root_uuid" "$old_luks_uuid" || fail "could not write System ESP GRUB"
     [[ -f $esp_mnt/EFI/BOOT/BOOTAA64.EFI ]] || fail "BOOTAA64.EFI missing after own-mode write"
     [[ -f $esp_mnt/omarchy-mac-root ]] || fail "omarchy-mac-root marker missing"
     rm -f "$esp_mnt/omarchy-usb-live"
     mode=own
   fi
+
+  # External USB installs leave any pending NVMe placement untouched.
+  esp_cleanup_nvme_live "$esp_mnt" "$source_mode"
 
   after_prot=$(esp_protected_hashes "$esp_mnt")
   [[ $before_prot == "$after_prot" ]] || fail "asahi/m1n1/vendorfw on the ESP changed — aborting"
@@ -1061,6 +1117,18 @@ apply_system_esp_bootloader() {
     rmdir "$esp_mnt"
   fi
   printf '%s\n' "$mode"
+}
+
+running_from_nvme_installer() {
+  # This program runs only from OMARCHYLIVE/the live overlay. If that payload
+  # is on NVMe, it is the temporary installer even when GPT naming failed.
+  disk_is_nvme "$live_disk"
+}
+
+refuse_nvme_installer_action() {
+  local action=$1
+  running_from_nvme_installer || return 0
+  fail "$action is disabled while booted from omarchy-install; choose Install into free space"
 }
 
 # First boot of the new root deletes GPT name omarchy-install and grows.
@@ -1085,10 +1153,10 @@ install_into_free_space() {
   local hole_start hole_size hole_end
   local before_names before_apple backup
   local root_part root_dev root_mnt esp_part
-  local root_uuid esp_uuid luks_uuid=""
+  local root_uuid esp_uuid luks_uuid="" planned_luks=""
   local esp_mode encrypt_root=0
   local created_parts=()
-  local nvme_installer=0 keep_grub_default=1 force_own=0
+  local nvme_installer=0
 
   command -v parted >/dev/null || fail "parted not found"
   require_graphical_payload
@@ -1159,14 +1227,13 @@ install_into_free_space() {
   [[ -n $source_esp ]] || fail "no ESP on the live disk $source_dev"
   esp_part=$(existing_esp_on "$target_name" || true)
   [[ -n $esp_part ]] || fail "$target_dev has no ESP; will not create one next to APFS"
-  if [[ $target_name == "$live_disk" ]] && disk_is_nvme "$target_name"; then
-    inst=$(installer_partition_on "$target_name" || true)
-    if [[ $inst == "$live_partition" ]]; then
-      nvme_installer=1
-      keep_grub_default=0
-      force_own=1
-    fi
+  if [[ $target_name == "$live_disk" ]] && running_from_nvme_installer; then
+    nvme_installer=1
   fi
+
+  planned_luks=""
+  (( encrypt_root == 0 )) || planned_luks=planned
+  preflight_system_esp_boot_files "$source_esp" "$esp_part" "$planned_luks"
 
   backup=$(mktemp /tmp/omarchy-gpt-${target_name}.XXXXXX)
   if command -v sfdisk >/dev/null; then
@@ -1241,12 +1308,15 @@ EOF
   rm -f "$root_mnt/omarchy-mac-overlay-write"
   : >"$root_mnt/etc/machine-id"
 
-  # USB free-space next to a live root keeps that GRUB default. The NVMe
-  # installer wrote a temporary live BOOTAA64.EFI — replace it (own-mode).
-  esp_mode=$(apply_system_esp_bootloader "$esp_part" "$root_uuid" "$source_esp" "$luks_uuid" "$keep_grub_default" "$force_own")
+  # Free-space beside an existing root keeps that root as the default. An
+  # NVMe placement restores a saved owner EFI and piggybacks; only a System
+  # ESP that had no bootloader becomes installer-owned.
+  esp_mode=$(apply_system_esp_bootloader "$esp_part" "$root_uuid" "$source_esp" "$luks_uuid")
 
   esp_uuid=$(blkid -s UUID -o value "$esp_part")
-  printf 'UUID=%s /boot vfat defaults,fmask=0133,dmask=0022 0 2\n' "$esp_uuid" >>"$root_mnt/etc/fstab"
+  mkdir -p "$root_mnt/boot/efi"
+  printf 'UUID=%s /boot/efi vfat defaults,fmask=0133,dmask=0022 0 2\n' "$esp_uuid" >>"$root_mnt/etc/fstab"
+  write_shared_esp_notice "$root_mnt" "$esp_uuid" "$esp_mode"
 
   personalize_graphical_session "$root_mnt" "$root_dev"
   if (( nvme_installer == 1 )); then
@@ -1297,11 +1367,13 @@ install_over_existing_root() {
   local name size bytes found_any=0
   local candidates=()
   local source_esp esp_part root_part root_dev root_mnt
-  local root_uuid esp_uuid luks_uuid="" payload_bytes
+  local root_uuid esp_uuid luks_uuid="" planned_luks="" payload_bytes
+  local old_root_uuid="" old_luks_uuid="" old_fstype
   local before_apple after_apple backup m esp_mode encrypt_root=0
 
   command -v parted >/dev/null || fail "parted not found"
   require_graphical_payload
+  refuse_nvme_installer_action "Reinstall an existing Omarchy root"
 
   payload_bytes=$(live_payload_used_bytes)
   source_esp=$(esp_partition_on "$live_disk" || true)
@@ -1311,13 +1383,14 @@ install_over_existing_root() {
   while read -r name; do
     [[ $name == "$live_disk" ]] && continue
     existing_esp_on "$name" >/dev/null || continue
-    root_part=$(existing_omarchy_root_on "$name" || true)
-    [[ -n $root_part ]] || continue
-    [[ $root_part == "$live_partition" ]] && continue
-    found_any=1
-    bytes=$(lsblk -dn -b -o SIZE "$root_part")
-    (( bytes >= payload_bytes + 64 * 1024 * 1024 )) || continue
-    candidates+=("$(existing_root_row "$root_part")")
+    while read -r root_part; do
+      [[ -n $root_part ]] || continue
+      [[ $root_part == "$live_partition" ]] && continue
+      found_any=1
+      bytes=$(lsblk -dn -b -o SIZE "$root_part")
+      (( bytes >= payload_bytes + 64 * 1024 * 1024 )) || continue
+      candidates+=("$(existing_root_row "$root_part")")
+    done < <(existing_omarchy_roots_on "$name" || true)
   done < <(lsblk -dn -o NAME)
 
   if (( found_any == 0 )); then
@@ -1335,6 +1408,16 @@ install_over_existing_root() {
   esp_part=$(existing_esp_on "$target_name") || fail "$target_dev has no ESP"
   [[ $root_part == "$live_partition" ]] && fail "refusing to overwrite the live payload"
   size=$(lsblk -dn -o SIZE "$root_part")
+  old_fstype=$(lsblk -dn -o FSTYPE "$root_part")
+  if [[ $old_fstype == btrfs ]]; then
+    old_root_uuid=$(blkid -s UUID -o value "$root_part")
+    [[ -n $old_root_uuid ]] || fail "no UUID on existing btrfs root $root_part"
+  elif [[ $old_fstype == crypto_LUKS ]]; then
+    old_luks_uuid=$(blkid -s UUID -o value "$root_part")
+    [[ -n $old_luks_uuid ]] || fail "no UUID on existing LUKS root $root_part"
+  else
+    fail "$root_part changed type while selecting it (now ${old_fstype:-unknown})"
+  fi
 
   printf '==> selected %s on %s (%s)\n' "$root_part" "$target_dev" "$size"
   ask_desktop_user
@@ -1351,6 +1434,10 @@ install_over_existing_root() {
   fi
 
   mark_install_start
+
+  planned_luks=""
+  (( encrypt_root == 0 )) || planned_luks=planned
+  preflight_system_esp_boot_files "$source_esp" "$esp_part" "$planned_luks"
 
   backup=$(mktemp /tmp/omarchy-gpt-${target_name}.XXXXXX)
   if command -v sfdisk >/dev/null; then
@@ -1408,10 +1495,13 @@ EOF
   rm -f "$root_mnt/omarchy-mac-overlay-write"
   : >"$root_mnt/etc/machine-id"
 
-  esp_mode=$(apply_system_esp_bootloader "$esp_part" "$root_uuid" "$source_esp" "$luks_uuid")
+  esp_mode=$(apply_system_esp_bootloader "$esp_part" "$root_uuid" "$source_esp" \
+    "$luks_uuid" "$old_root_uuid" "$old_luks_uuid")
 
   esp_uuid=$(blkid -s UUID -o value "$esp_part")
-  printf 'UUID=%s /boot vfat defaults,fmask=0133,dmask=0022 0 2\n' "$esp_uuid" >>"$root_mnt/etc/fstab"
+  mkdir -p "$root_mnt/boot/efi"
+  printf 'UUID=%s /boot/efi vfat defaults,fmask=0133,dmask=0022 0 2\n' "$esp_uuid" >>"$root_mnt/etc/fstab"
+  write_shared_esp_notice "$root_mnt" "$esp_uuid" "$esp_mode"
 
   personalize_graphical_session "$root_mnt" "$root_dev"
 
@@ -1441,16 +1531,18 @@ install_grub_for_existing_root() {
   local source_esp esp_part root_part root_uuid
   local esp_mode
 
+  refuse_nvme_installer_action "Write GRUB for an existing Omarchy root"
   source_esp=$(esp_partition_on "$live_disk" || true)
   [[ -n $source_esp ]] || fail "no ESP on the live USB $source_dev"
 
   while read -r name; do
     [[ $name == "$live_disk" ]] && continue
     existing_esp_on "$name" >/dev/null || continue
-    root_part=$(existing_omarchy_root_on "$name" || true)
-    [[ -n $root_part ]] || continue
-    [[ $(lsblk -dn -o FSTYPE "$root_part") == crypto_LUKS ]] && continue
-    candidates+=("$(existing_root_row "$root_part")")
+    while read -r root_part; do
+      [[ -n $root_part ]] || continue
+      [[ $(lsblk -dn -o FSTYPE "$root_part") == crypto_LUKS ]] && continue
+      candidates+=("$(existing_root_row "$root_part")")
+    done < <(existing_omarchy_roots_on "$name" || true)
   done < <(lsblk -dn -o NAME)
 
   (( ${#candidates[@]} > 0 )) || fail "no unencrypted Omarchy root found. Reinstall an encrypted root, or install into free space first."
