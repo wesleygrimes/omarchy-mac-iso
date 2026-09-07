@@ -20,6 +20,11 @@ for f in "${repo_root}"/bin/omarchy-mac-iso-* "${repo_root}"/builder/*.sh \
 done
 
 check "sh -n init" sh -n "${repo_root}/configs/initramfs/init"
+check "bash -n provisioning-chroot rehearsal" bash -n "${repo_root}/test/provisioning-chroot"
+check "bash -n real user provisioning rehearsal" bash -n "${repo_root}/test/provisioning-user-chroot"
+check "both System ESP install paths assert the ownership notice" bash -c \
+  '[[ $(grep -c "^  assert_shared_esp_notice " "$1") == 2 ]]' \
+  _ "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 
 if command -v shellcheck >/dev/null 2>&1; then
     for f in "${repo_root}"/bin/omarchy-mac-iso-* "${repo_root}"/builder/*.sh; do
@@ -323,18 +328,19 @@ check "ISO chroot stubs live outside /tmp" grep -q \
   'usr/local/share/omarchy-mac-iso' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "ISO chroot stubs electron-gl wrap so provision-user does not sudo" grep -q \
-  'ISO chroot skips user-level electron-gl wrap' \
+  'ISO chroot uses the electron-gl wrapper already installed by root' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
-check "ISO chroot writes Chromium GL wrapper as root after stubs" \
+check "ISO chroot writes Chromium GL wrapper as root" \
   bash -c 'b=$(sed -n "/^seed_iso_chroot_electron_wrappers()/,/^}/p" "$1"); [[ -n $b ]] &&
     grep -qF "$2" <<<"$b" && ! grep -q runuser <<<"$b"' \
   bash "${repo_root}/configs/usb/rootfs/omarchy-mac-install" \
   'omarchy-cmd-electron-gl-wrap chromium /usr/bin/chromium'
-check "electron GL wrapper is written after chroot stubs are removed" \
+check "electron GL wrapper exists before stubs and user provisioning" \
   awk '/^provision_installed_system\(\)/{p=1}
-       p && /remove_boot_command_stubs/{r=1}
-       p && r && /seed_iso_chroot_electron_wrappers/{s=1}
-       p && /^}/{exit (s ? 0 : 1)}' \
+       p && /^  seed_iso_chroot_electron_wrappers /{s=1}
+       p && /^  install_boot_command_stubs /{if (!s) bad=1; b=1}
+       p && /^  chroot .* runuser /{if (!s || !b) bad=1; u=1}
+       p && /^}/{exit (!bad && s && b && u ? 0 : 1)}' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "free-space does not skip an NVMe live disk" \
   bash -c 'awk "/^install_into_free_space\\(\\)/,/^existing_root_row/" "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-install" | grep -q "disk_is_nvme \"\$name\""'
@@ -589,9 +595,18 @@ check "rootfs copies the j613 DCP dtbo" grep -q j613-dcp.dtbo \
 check "installer seeds mkinitcpio.conf for alt-bootloaders" grep -q \
   'seed_target_mkinitcpio_conf' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
-check "apply-system failure still finishes the desktop" grep -q \
-  'finishing desktop setup anyway' \
+check "target provisioning behavior" bash "${repo_root}/test/provisioning"
+check "installer mounts persistent logs before provisioning" \
+  awk '/^personalize_graphical_session\(\)/{p=1}
+       p && /mount -o subvol=@log/{l=1}
+       p && /set \+e/{s=1}
+       p && s && /provision_installed_system/{seen=1; if (!l) bad=1}
+       p && /^}/{exit (seen && !bad) ? 0 : 1}' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+for package in avd-fw libva-v4l2_request-avd; do
+  check "payload includes $package for offline video setup" grep -qx "$package" \
+    "${repo_root}/configs/usb/rootfs/packages"
+done
 check "installer requires sudo in the payload" grep -q 'usr/bin/sudo' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "installer writes 00-omarchy-wheel sudoers" grep -q 'sudoers.d/00-omarchy-wheel' \

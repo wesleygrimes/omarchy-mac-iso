@@ -540,8 +540,33 @@ target_chroot_unbind() {
 # (not /usr/local/sbin) or audio.sh still pacmans from the network.
 iso_chroot_stub_binds=()
 
+# Packaged commands may be absolute symlinks into /usr/bin. Resolve them
+# inside the target, or mount follows the link into the live system instead.
+bind_target_stub() {
+  local root_mnt=$1 stub=$2 path=$3 optional=${4:-0} resolved dest bound status
+  # Probe existence in the chroot too. Only a deliberately absent optional
+  # alias may be skipped; dangling links and broken chroot tools must fail.
+  if resolved=$(chroot "$root_mnt" /bin/bash -c '
+    if [[ ! -e $1 && ! -L $1 ]]; then exit 44; fi
+    exec /usr/bin/readlink -e -- "$1"
+  ' bash "$path"); then
+    :
+  else
+    status=$?
+    if (( optional == 1 && status == 44 )); then return 0; fi
+    fail "Cannot resolve target stub: $path (exit $status)"
+  fi
+  [[ $resolved == /* && $resolved != *'/../'* ]] || fail "Invalid target path: $path"
+  dest=$root_mnt$resolved
+  for bound in "${iso_chroot_stub_binds[@]}"; do
+    [[ $bound == "$dest" ]] && return 0
+  done
+  mount --bind "$stub" "$dest"
+  iso_chroot_stub_binds+=("$dest")
+}
+
 install_boot_command_stubs() {
-  local root_mnt=$1 cmd dest stub_dir
+  local root_mnt=$1 cmd dest stub_dir optional
   # Keep stubs off /tmp: target_chroot_bind mounts a tmpfs there and would
   # hide files used as bind-mount sources, so optional-apps.sh ran the real
   # omarchy-install-1password and curl'd with no DNS.
@@ -570,7 +595,7 @@ install_boot_command_stubs() {
   chmod 755 "$stub_dir/omarchy-iso-chroot-skip-optional-apps"
   printf '%s\n' \
     '#!/bin/bash' \
-    'echo "ISO chroot skips user-level electron-gl wrap (needs sudo); root writes /usr/local/bin after this"' \
+    'echo "ISO chroot uses the electron-gl wrapper already installed by root"' \
     'exit 0' \
     >"$stub_dir/omarchy-iso-chroot-skip-electron-wrap"
   chmod 755 "$stub_dir/omarchy-iso-chroot-skip-electron-wrap"
@@ -583,38 +608,31 @@ install_boot_command_stubs() {
     "$root_mnt/usr/share/omarchy/bin/omarchy-pkg-add" \
     "$root_mnt/usr/share/omarchy/bin/omarchy-pkg-aur-add"
   do
-    [[ -e $dest ]] || continue
-    mount --bind "$stub_dir/omarchy-iso-chroot-stub" "$dest"
-    iso_chroot_stub_binds+=("$dest")
+    bind_target_stub "$root_mnt" "$stub_dir/omarchy-iso-chroot-stub" "${dest#"$root_mnt"}"
   done
   for dest in \
     "$root_mnt/usr/share/omarchy/bin/omarchy-install-1password" \
     "$root_mnt/usr/bin/omarchy-install-1password"
   do
-    [[ -e $dest ]] || continue
-    mount --bind "$stub_dir/omarchy-iso-chroot-skip-1password" "$dest"
-    iso_chroot_stub_binds+=("$dest")
+    optional=0
+    if [[ $dest == "$root_mnt/usr/bin/"* ]]; then optional=1; fi
+    bind_target_stub "$root_mnt" "$stub_dir/omarchy-iso-chroot-skip-1password" "${dest#"$root_mnt"}" "$optional"
   done
   dest="$root_mnt/usr/share/omarchy/install/post-install/optional-apps.sh"
-  if [[ -e $dest ]]; then
-    mount --bind "$stub_dir/omarchy-iso-chroot-skip-optional-apps" "$dest"
-    iso_chroot_stub_binds+=("$dest")
-  fi
+  bind_target_stub "$root_mnt" "$stub_dir/omarchy-iso-chroot-skip-optional-apps" "${dest#"$root_mnt"}"
   for dest in \
     "$root_mnt/usr/share/omarchy/bin/omarchy-cmd-electron-gl-wrap" \
     "$root_mnt/usr/bin/omarchy-cmd-electron-gl-wrap"
   do
-    [[ -e $dest ]] || continue
-    mount --bind "$stub_dir/omarchy-iso-chroot-skip-electron-wrap" "$dest"
-    iso_chroot_stub_binds+=("$dest")
+    optional=0
+    if [[ $dest == "$root_mnt/usr/bin/"* ]]; then optional=1; fi
+    bind_target_stub "$root_mnt" "$stub_dir/omarchy-iso-chroot-skip-electron-wrap" "${dest#"$root_mnt"}" "$optional"
   done
   for dest in \
     "$root_mnt/usr/bin/mise" \
     "$root_mnt/usr/share/omarchy/bin/omarchy-mise-install"
   do
-    [[ -e $dest ]] || continue
-    mount --bind "$stub_dir/omarchy-iso-chroot-skip-mise" "$dest"
-    iso_chroot_stub_binds+=("$dest")
+    bind_target_stub "$root_mnt" "$stub_dir/omarchy-iso-chroot-skip-mise" "${dest#"$root_mnt"}"
   done
 }
 
@@ -635,7 +653,9 @@ remove_boot_command_stubs() {
 }
 
 # User-level electron-gl.sh would sudo-tee /usr/local/bin. Write the
-# Chromium PATH wrapper as root after stubs are gone. 1Password is not
+# Chromium PATH wrapper as root before installing stubs: user setup rewrites
+# its desktop entry, and xdg-settings requires that executable to exist.
+# 1Password is not
 # on the payload (optional-apps skipped); omarchy-install-1password later
 # installs that wrapper.
 seed_iso_chroot_electron_wrappers() {
@@ -652,7 +672,7 @@ seed_iso_chroot_electron_wrappers() {
   then
     printf '==> Chromium software-GL wrapper in /usr/local/bin\n'
   else
-    printf '==> Chromium software-GL wrapper skipped; first login can retry\n'
+    return 1
   fi
 }
 
@@ -734,13 +754,14 @@ seed_no_hardware_cursors() {
 # autostart (omarchy-provision-first-run: welcome / timezone / Wi-Fi /
 # update).
 provision_installed_system() {
-  local root_mnt=$1 user=$2 apply_status
-
   if [[ ${OMARCHY_INSTALL_DRY_RUN:-} == 1 ]]; then
-    printf 'dry-run: omarchy-apply-system --install-user %s --first-install\n' "$user"
+    printf 'dry-run: omarchy-apply-system --install-user %s --first-install\n' "$2"
     printf 'dry-run: omarchy-provision-user --first-install\n'
     return 0
   fi
+  (
+  set -euo pipefail
+  local root_mnt=$1 user=$2
 
   [[ -x $root_mnt/usr/bin/omarchy-apply-system ]] \
     || fail "omarchy-apply-system missing — rebuild with --usb --rootfs"
@@ -748,26 +769,25 @@ provision_installed_system() {
     || fail "omarchy-provision-user missing — rebuild with --usb --rootfs"
 
   seed_target_mkinitcpio_conf "$root_mnt"
+  # Keep cleanup active even when a bind or a setup command fails midway.
+  # Capture the path now: errexit can unwind local variables before EXIT.
+  trap "$(printf 'remove_boot_command_stubs %q; target_chroot_unbind' "$root_mnt")" EXIT
   target_chroot_bind "$root_mnt"
+  seed_iso_chroot_electron_wrappers "$root_mnt"
   install_boot_command_stubs "$root_mnt"
+  mkdir -p "$root_mnt/opt/packages" "$root_mnt/var/log"
 
   printf '==> omarchy-apply-system --install-user %s --first-install\n' "$user"
-  apply_status=0
   chroot "$root_mnt" env \
       OMARCHY_PATH=/usr/share/omarchy \
       OMARCHY_SETUP_CONTEXT=iso-chroot \
       OMARCHY_LOG_TO_STDOUT=1 \
-      omarchy-apply-system --install-user "$user" --first-install \
-    || apply_status=$?
-  if (( apply_status != 0 )); then
-    printf '==> omarchy-apply-system failed (exit %s); finishing desktop setup anyway\n' \
-      "$apply_status"
-  fi
+      omarchy-apply-system --install-user "$user" --first-install
 
   seed_tokyo_night "$root_mnt" "$user"
 
   printf '==> omarchy-provision-user --first-install for %s\n' "$user"
-  if ! chroot "$root_mnt" runuser -u "$user" -- env \
+  chroot "$root_mnt" runuser -u "$user" -- env \
       HOME=/home/"$user" USER="$user" LOGNAME="$user" \
       XDG_RUNTIME_DIR=/tmp \
       OMARCHY_PATH=/usr/share/omarchy \
@@ -776,14 +796,28 @@ provision_installed_system() {
       OMARCHY_USER_NAME="$desktop_full_name" \
       OMARCHY_USER_EMAIL="$desktop_email" \
       omarchy-provision-user --first-install
-  then
-    printf '==> omarchy-provision-user failed for %s; first login will retry\n' "$user"
-  fi
   seed_no_hardware_cursors "$root_mnt" "$user"
 
   remove_boot_command_stubs "$root_mnt"
-  seed_iso_chroot_electron_wrappers "$root_mnt"
   target_chroot_unbind
+  trap - EXIT
+  ) 2>&1 | tee -a "$1/var/log/omarchy-install.log"
+}
+
+# The live console bypasses NetworkManager authorization and quiets kernel
+# output. Neither setting belongs on an installed desktop. Preserve the
+# selected Wi-Fi backend, including any live-session compatibility fix.
+finalize_installed_services() {
+  local root_mnt=$1 live_conf=$1/etc/NetworkManager/conf.d/nm-live.conf
+  if [[ -f $live_conf ]]; then
+    sed '/^[[:space:]]*auth-polkit[[:space:]]*=/d' "$live_conf" \
+      >"$root_mnt/etc/NetworkManager/conf.d/10-omarchy-mac-network.conf"
+    rm -f "$live_conf"
+  fi
+  systemctl --root="$root_mnt" disable omarchy-mac-quiet-console.service
+  rm -f "$root_mnt/etc/sysctl.d/90-omarchy-quiet-console.conf" \
+    "$root_mnt/etc/systemd/system.conf.d/show-status.conf"
+  systemctl --root="$root_mnt" enable systemd-timesyncd.service
 }
 
 # Same baseline install.sh records at the end of a by-hand install, and the
@@ -827,7 +861,7 @@ snapshot_factory_baseline() {
 # graphical.target. Mount @home before useradd so /home isn't on @.
 personalize_graphical_session() {
   local root_mnt=$1 root_part=$2
-  local user=$desktop_user pass=$desktop_pass home_mounted=0 session
+  local user=$desktop_user pass=$desktop_pass home_mounted=0 log_mounted=0 session provision_status
 
   require_graphical_payload "$root_mnt"
   session=$(basename "$(wayland_session_path "$root_mnt")")
@@ -872,10 +906,26 @@ personalize_graphical_session() {
       || fail "sudoers is invalid after writing 00-omarchy-wheel"
   fi
 
+  mkdir -p "$root_mnt/var/log"
+  if ! findmnt "$root_mnt/var/log" >/dev/null; then
+    mount -o subvol=@log "$root_part" "$root_mnt/var/log"
+    log_mounted=1
+  fi
+  # Do not invoke the function in an if/|| condition: Bash would suppress
+  # errexit in its entire body, hiding intermediate provisioning failures.
+  set +e
   provision_installed_system "$root_mnt" "$user"
+  provision_status=$?
+  set -e
+  if (( log_mounted == 1 )); then
+    umount "$root_mnt/var/log"
+  fi
   if (( home_mounted == 1 )); then
     umount "$root_mnt/home"
   fi
+  (( provision_status == 0 )) \
+    || fail "Target provisioning failed; see @log/omarchy-install.log on the target. Installation is incomplete."
+  finalize_installed_services "$root_mnt"
 
   rm -f "$root_mnt/etc/systemd/system/getty@tty1.service.d/autologin.conf"
   rmdir "$root_mnt/etc/systemd/system/getty@tty1.service.d" 2>/dev/null || true
@@ -1183,8 +1233,8 @@ apply_system_esp_bootloader() {
   patch_j613=$SHARE/omarchy-mac-patch-j613-dcp
   [[ -x $patch_j613 ]] || patch_j613=$here/omarchy-mac-patch-j613-dcp
   if [[ -x $patch_j613 ]]; then
-    "$patch_j613" --esp "$esp_mnt" || \
-      printf '==> j613 DCP patch skipped (display stays simpledrm until it succeeds)\n'
+    "$patch_j613" --esp "$esp_mnt" >&2 || \
+      printf '==> j613 DCP patch skipped (display stays simpledrm until it succeeds)\n' >&2
   fi
 
   if (( esp_mounted_by_us == 1 )); then
@@ -1394,6 +1444,8 @@ EOF
   write_shared_esp_notice "$root_mnt" "$esp_uuid" "$esp_mode"
 
   personalize_graphical_session "$root_mnt" "$root_dev"
+  assert_shared_esp_notice "$root_mnt" "$esp_uuid" "$esp_mode" \
+    || fail "Shared ESP ownership notice missing after provisioning"
   if (( nvme_installer == 1 )); then
     seed_installer_consume "$root_mnt"
   fi
@@ -1579,6 +1631,8 @@ EOF
   write_shared_esp_notice "$root_mnt" "$esp_uuid" "$esp_mode"
 
   personalize_graphical_session "$root_mnt" "$root_dev"
+  assert_shared_esp_notice "$root_mnt" "$esp_uuid" "$esp_mode" \
+    || fail "Shared ESP ownership notice missing after provisioning"
 
   sync
   umount "$root_mnt"

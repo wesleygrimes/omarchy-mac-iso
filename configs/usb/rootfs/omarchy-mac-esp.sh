@@ -74,12 +74,29 @@ esp_nvme_restore_can_piggyback() {
 
 write_shared_esp_notice() {
   local root_mnt=$1 esp_uuid=$2 mode=$3
-  [[ $mode == piggyback ]] || return 0
+  case $mode in
+    own) return 0 ;;
+    piggyback) ;;
+    *) printf 'error: invalid ESP ownership mode: %s\n' "$mode" >&2; return 1 ;;
+  esac
   cat >"$root_mnt/etc/omarchy-mac-iso-shared-esp" <<EOF
 This root shares EFI system partition UUID=$esp_uuid with another installation.
 Do not run omarchy-system-boot-to-esp here: it would replace the shared GRUB owner.
 Kernel/initramfs updates must sync EFI/omarchy/<root-uuid>/ explicitly.
 EOF
+  assert_shared_esp_notice "$root_mnt" "$esp_uuid" "$mode"
+}
+
+assert_shared_esp_notice() {
+  local root_mnt=$1 esp_uuid=$2 mode=$3
+  case $mode in
+    own) return 0 ;;
+    piggyback)
+      grep -qF "UUID=$esp_uuid" "$root_mnt/etc/omarchy-mac-iso-shared-esp" && return 0
+      ;;
+  esac
+  printf 'error: shared ESP ownership notice missing or invalid\n' >&2
+  return 1
 }
 
 # Leave room for FAT metadata and an interrupted retry in addition to the exact
