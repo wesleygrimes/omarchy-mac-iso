@@ -22,6 +22,8 @@ check() {
 work=$(mktemp -d)
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
+export ESP_UUID_DIR=$work/present-uuids
+mkdir -p "$ESP_UUID_DIR"
 
 fake_live=$work/live-esp
 mkdir -p "$fake_live"
@@ -43,11 +45,37 @@ printf 'legacy-initrd\n' >"$own/initramfs-omarchy-usb-root.img"
 before=$(esp_protected_hashes "$own")
 
 own_uuid=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee
+: >"$ESP_UUID_DIR/$own_uuid"
 esp_copy_unique_kernels "$fake_live" "$own" "$own_uuid"
 if command -v grub-mkstandalone >/dev/null; then
   write_owned_esp_grub "$own" "$own_uuid" "$embed"
   after=$(esp_protected_hashes "$own")
   check "own mode writes BOOTAA64.EFI" "[[ -f '$own/EFI/BOOT/BOOTAA64.EFI' ]]"
+  # Inspect the real standalone image, not just the builder's argument text.
+  # GRUB's '[' command comes from test.mod; without it conditional includes
+  # silently leave only the owning menu visible.
+  strings "$own/EFI/BOOT/BOOTAA64.EFI" >"$work/grub-strings"
+  check "standalone GRUB packages the module for conditional includes" \
+    "grep -qx 'boot/grub/arm64-efi/test.mod' '$work/grub-strings'"
+  check "new standalone loader passes the compatibility preflight" \
+    "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; esp_require_supported_grub '$own'"
+  unsupported=$work/unsupported-esp
+  mkdir -p "$unsupported/EFI/BOOT" "$unsupported/grub"
+  grub-mkstandalone -O arm64-efi --fonts="" --locales="" --themes="" \
+    --install-modules="linux fat ext2 btrfs part_gpt search search_label search_fs_uuid search_fs_file echo normal configfile gzio reboot sleep" \
+    --modules="part_gpt fat search search_fs_file configfile linux echo normal" \
+    -o "$unsupported/EFI/BOOT/BOOTAA64.EFI" "boot/grub/grub.cfg=$embed"
+  unsupported_hash=$(sha256sum "$unsupported/EFI/BOOT/BOOTAA64.EFI")
+  check "old standalone loader fails before destructive installation" \
+    "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; ! esp_require_supported_grub '$unsupported'"
+  check "compatibility preflight preserves the old EFI bytes" \
+    "[[ \$(sha256sum '$unsupported/EFI/BOOT/BOOTAA64.EFI') == '$unsupported_hash' ]]"
+  cp "$unsupported/EFI/BOOT/BOOTAA64.EFI" "$unsupported/EFI/BOOT/BOOTAA64.EFI.omarchy-nvme-bak"
+  cp "$own/EFI/BOOT/BOOTAA64.EFI" "$unsupported/EFI/BOOT/BOOTAA64.EFI"
+  : >"$unsupported/omarchy-nvme-live"
+  : >"$unsupported/grub/omarchy-nvme-had-bootloader"
+  check "NVMe preflight checks the saved owner instead of the new live loader" \
+    "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; ! esp_require_supported_grub '$unsupported'"
   check "own mode writes omarchy-mac-root marker" "[[ -f '$own/omarchy-mac-root' ]]"
   check "own mode managed menu names the root UUID" "grep -q 'root=UUID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' '$own/grub/omarchy.cfg'"
   check "own mode managed menu has a top-level verbose entry" \
@@ -267,6 +295,8 @@ printf 'EXISTING-GRUB\n' >"$work/boot.aa64.expected"
 before_pig=$(esp_protected_hashes "$pig")
 first_uuid=11111111-2222-3333-4444-555555555555
 second_uuid=22222222-3333-4444-5555-666666666666
+: >"$ESP_UUID_DIR/$first_uuid"
+: >"$ESP_UUID_DIR/bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
 esp_copy_unique_kernels "$fake_live" "$pig" "$first_uuid"
 write_piggyback_esp_grub "$pig" "$first_uuid"
 after_pig=$(esp_protected_hashes "$pig")
@@ -423,6 +453,10 @@ check "piggyback leaves m1n1 hash unchanged" "[[ '$before_pig' == '$after_pig' ]
 check "esp_has_bootloader is true for piggyback ESP" "[[ -f '$pig/EFI/BOOT/BOOTAA64.EFI' ]]"
 check "esp_has_bootloader is false on an empty ESP dir" \
   "[[ ! -f '$work/empty-esp/EFI/BOOT/BOOTAA64.EFI' ]]"
+check "compatibility preflight permits an empty UEFI-only ESP" \
+  "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; esp_require_supported_grub '$work/empty-esp'"
+check "compatibility preflight does not classify an unrelated owner as old ISO GRUB" \
+  "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; esp_require_supported_grub '$pig'"
 
 p7_pairs='NAME="nvme0n1p7" FSTYPE="crypto_LUKS" LABEL="" PARTLABEL="root"'
 asahi_pairs='NAME="nvme0n1p5" FSTYPE="crypto_LUKS" LABEL="" PARTLABEL=""'

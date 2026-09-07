@@ -7,6 +7,29 @@ esp_has_bootloader() {
   [[ -f $esp_mnt/EFI/BOOT/BOOTAA64.EFI ]]
 }
 
+# Earlier ISO standalone loaders omitted test.mod even though the generated
+# include chain uses '['. Reinstalling restores that old loader, not the live
+# image's new one. Recognize only our known standalone layout; do not parse or
+# rewrite a foreign owner's configuration, or replace its EFI executable.
+esp_require_supported_grub() {
+  local esp_mnt=$1 loader=$1/EFI/BOOT/BOOTAA64.EFI
+  if [[ -f $esp_mnt/omarchy-nvme-live && -f $esp_mnt/grub/omarchy-nvme-had-bootloader ]]; then
+    loader=$esp_mnt/EFI/BOOT/BOOTAA64.EFI.omarchy-nvme-bak
+    [[ -f $loader ]] || {
+      printf 'error: saved pre-installer EFI bootloader is missing\n' >&2
+      return 1
+    }
+  fi
+  [[ -f $loader ]] || return 0
+  if grep -aqF 'boot/grub/arm64-efi/normal.mod' "$loader" &&
+    grep -aqF 'search --no-floppy --file /omarchy-mac-root --set=root' "$loader" &&
+    ! grep -aqF 'boot/grub/arm64-efi/test.mod' "$loader"; then
+    printf 'error: the existing ISO GRUB loader lacks test.mod and cannot load its conditional menu includes\n' >&2
+    printf 'Restore a compatible owning GRUB loader before reinstalling; the installer will not replace its bootloader or rewrite its menu.\n' >&2
+    return 1
+  fi
+}
+
 esp_protected_hashes() {
   local esp_mnt=$1
   # boot.bin is the one m1n1 file the j613 DCP slot patch may change.
@@ -273,7 +296,7 @@ EOF
 # btrfs UUIDs are intentionally ignored; a full grub-mkconfig output is not a
 # fragment and must never be sourced or concatenated here.
 write_managed_omarchy_grub() {
-  local esp_mnt=$1 default_line=${2:-} cfg base
+  local esp_mnt=$1 default_line=${2:-} current_uuid=${3:-} cfg base
   local out=$esp_mnt/grub/omarchy.cfg
   local tmp=$esp_mnt/grub/.omarchy.cfg.new
   {
@@ -286,6 +309,12 @@ write_managed_omarchy_grub() {
       [[ -f $cfg ]] || continue
       base=${cfg##*/}
       [[ $base =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}[.]cfg$ ]] || continue
+      if managed_root_is_stale "$esp_mnt" "${base%.cfg}" "$current_uuid"; then
+        # Retain the fragment and kernel files for recovery/reconnected disks,
+        # but do not offer a root whose devices are no longer present.
+        printf '==> omitting absent Omarchy root %s from the active menu\n' "${base%.cfg}" >&2
+        continue
+      fi
       cat "$cfg"
     done
   } >"$tmp" || return 1
@@ -317,6 +346,43 @@ esp_uuid_present() {
   local uuid=$1 dir=${ESP_UUID_DIR:-/dev/disk/by-uuid}
   [[ -n $uuid ]] || return 1
   [[ -e $dir/$uuid ]]
+}
+
+# Only classify our exact generated fragment, never the owning grub.cfg or
+# custom.cfg. A locked LUKS root is present when its outer UUID is present,
+# even though its inner btrfs UUID cannot be seen until it is unlocked.
+# Unknown/customized fragments and failed device discovery are preserved.
+managed_root_is_stale() {
+  local esp_mnt=$1 root_uuid=$2 current_uuid=${3:-}
+  local cfg=$esp_mnt/grub/omarchy-roots/$root_uuid.cfg
+  local line luks_uuid="" linux_args devices
+  [[ $root_uuid != "$current_uuid" && -f $cfg ]] || return 1
+  while IFS= read -r line; do
+    [[ $line == *cryptdevice=* ]] || continue
+    if [[ $line =~ cryptdevice=UUID=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}):root:allow-discards ]]; then
+      luks_uuid=${BASH_REMATCH[1]}
+    else
+      return 1
+    fi
+  done <"$cfg"
+  linux_args=$(root_linux_args "$root_uuid" "$luks_uuid")
+  cmp -s "$cfg" <(grub_root_menu_entries "Omarchy Mac (root $root_uuid)" \
+    "$linux_args" "/EFI/omarchy/$root_uuid" 1) || return 1
+  if [[ -n ${ESP_UUID_DIR:-} ]]; then
+    [[ -d $ESP_UUID_DIR ]] || return 1
+    esp_uuid_present "$root_uuid" && return 1
+    if [[ -n $luks_uuid ]] && esp_uuid_present "$luks_uuid"; then
+      return 1
+    fi
+  else
+    devices=$(lsblk --list --noheadings --output UUID) || return 1
+    [[ -n $devices ]] || return 1
+    grep -Fxq "$root_uuid" <<<"$devices" && return 1
+    if [[ -n $luks_uuid ]] && grep -Fxq "$luks_uuid" <<<"$devices"; then
+      return 1
+    fi
+  fi
+  return 0
 }
 
 # A leftover ISO shared-kernel line (/EFI/omarchy/vmlinuz) is stale when
@@ -391,13 +457,14 @@ write_piggyback_esp_grub() {
     >"$root_cfg"
   if default_uuid=$(managed_default_uuid "$esp_mnt"); then
     if managed_default_matches_replacement "$esp_mnt" "$default_uuid" \
-      "$old_root_uuid" "$old_luks_uuid"; then
+      "$old_root_uuid" "$old_luks_uuid" || \
+      managed_root_is_stale "$esp_mnt" "$default_uuid" "$root_uuid"; then
       default_uuid=$root_uuid
       printf '%s\n' "$default_uuid" >"$esp_mnt/grub/omarchy-default-root"
     fi
     default_line="set default='Omarchy Mac (root $default_uuid)'"
   fi
-  write_managed_omarchy_grub "$esp_mnt" "$default_line" || return 1
+  write_managed_omarchy_grub "$esp_mnt" "$default_line" "$root_uuid" || return 1
   ensure_custom_sources_omarchy "$esp_mnt" || return 1
   if [[ -n $old_root_uuid || -n $old_luks_uuid ]]; then
     rewrite_legacy=1
@@ -463,8 +530,8 @@ write_owned_esp_grub() {
   rm -f "$cfg_tmp" "$efi_cfg_tmp" "$efi_tmp"
   grub-mkstandalone -O arm64-efi \
     --fonts="" --locales="" --themes="" \
-    --install-modules="linux fat ext2 btrfs part_gpt search search_label search_fs_uuid search_fs_file echo normal configfile gzio reboot sleep" \
-    --modules="part_gpt fat search search_fs_file configfile linux echo normal" \
+    --install-modules="linux fat ext2 btrfs part_gpt search search_label search_fs_uuid search_fs_file echo normal configfile test gzio reboot sleep" \
+    --modules="part_gpt fat search search_fs_file configfile linux echo normal test" \
     -o "$efi_tmp" \
     "boot/grub/grub.cfg=$embed_cfg" >/dev/null || {
       rm -f "$efi_tmp"
@@ -479,7 +546,8 @@ write_owned_esp_grub() {
     >"$root_cfg"
   if default_uuid=$(managed_default_uuid "$esp_mnt"); then
     if managed_default_matches_replacement "$esp_mnt" "$default_uuid" \
-      "$old_root_uuid" "$old_luks_uuid"; then
+      "$old_root_uuid" "$old_luks_uuid" || \
+      managed_root_is_stale "$esp_mnt" "$default_uuid" "$root_uuid"; then
       default_uuid=$root_uuid
       printf '%s\n' "$default_uuid" >"$esp_mnt/grub/omarchy-default-root"
     fi
@@ -488,7 +556,7 @@ write_owned_esp_grub() {
     printf '%s\n' "$default_uuid" >"$esp_mnt/grub/omarchy-default-root"
   fi
   default_line="set default='Omarchy Mac (root $default_uuid)'"
-  write_managed_omarchy_grub "$esp_mnt" "$default_line" || return 1
+  write_managed_omarchy_grub "$esp_mnt" "$default_line" "$root_uuid" || return 1
   ensure_custom_sources_omarchy "$esp_mnt" || return 1
   cat >"$cfg_tmp" <<'EOF'
 echo '========================================'

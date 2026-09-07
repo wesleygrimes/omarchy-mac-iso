@@ -1083,8 +1083,8 @@ EOF
 
   grub-mkstandalone -O arm64-efi \
     --fonts="" --locales="" --themes="" \
-    --install-modules="linux fat ext2 btrfs part_gpt search search_label search_fs_uuid search_fs_file echo normal configfile gzio reboot sleep" \
-    --modules="part_gpt fat search search_fs_file configfile linux echo normal" \
+    --install-modules="linux fat ext2 btrfs part_gpt search search_label search_fs_uuid search_fs_file echo normal configfile test gzio reboot sleep" \
+    --modules="part_gpt fat search search_fs_file configfile linux echo normal test" \
     -o "$esp_mnt/EFI/BOOT/BOOTAA64.EFI" \
     "boot/grub/grub.cfg=$SHARE/grub-embed-install.cfg"
 
@@ -1136,6 +1136,11 @@ preflight_system_esp_boot_files() {
     fail "refusing same-ESP boot files without an active NVMe-live placement"
   }
   [[ $source_mode != nvme ]] || strict_nvme=1
+  esp_require_supported_grub "$esp_mnt" || {
+    (( source_mounted_by_us == 0 )) || { umount "$source_mnt"; rmdir "$source_mnt"; }
+    (( esp_mounted_by_us == 0 )) || { umount "$esp_mnt"; rmdir "$esp_mnt"; }
+    fail "Unsupported existing GRUB loader; installation stopped before partition creation or formatting"
+  }
   esp_require_kernel_copy_space "$source_mnt" "$esp_mnt" "$luks_uuid" \
     "$strict_nvme" || {
       (( source_mounted_by_us == 0 )) || { umount "$source_mnt"; rmdir "$source_mnt"; }
@@ -1167,6 +1172,10 @@ apply_system_esp_bootloader() {
     mount "$esp_part" "$esp_mnt" >/dev/null
     esp_mounted_by_us=1
   fi
+  esp_require_supported_grub "$esp_mnt" || {
+    (( esp_mounted_by_us == 0 )) || { umount "$esp_mnt"; rmdir "$esp_mnt"; }
+    fail "Unsupported existing GRUB loader; boot files were not changed"
+  }
   before_prot=$(esp_protected_hashes "$esp_mnt")
 
   if [[ $source_esp == "$esp_part" ]]; then
@@ -1433,7 +1442,8 @@ EOF
   rm -f "$root_mnt/omarchy-mac-overlay-write"
   : >"$root_mnt/etc/machine-id"
 
-  # Free-space beside an existing root keeps that root as the default. An
+  # Free-space beside a present root keeps that root as the default; an
+  # erased managed default transfers to this new root. An
   # NVMe placement restores a saved owner EFI and piggybacks; only a System
   # ESP that had no bootloader becomes installer-owned.
   esp_mode=$(apply_system_esp_bootloader "$esp_part" "$root_uuid" "$source_esp" "$luks_uuid")

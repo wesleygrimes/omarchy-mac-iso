@@ -20,6 +20,39 @@ for f in "${repo_root}"/bin/omarchy-mac-iso-* "${repo_root}"/builder/*.sh \
 done
 
 check "sh -n init" sh -n "${repo_root}/configs/initramfs/init"
+check "every standalone GRUB builder includes and preloads test" awk '
+  /--install-modules=/ || /--modules=/ {
+    count++
+    line=$0
+    sub(/^[^"]*"/, "", line)
+    sub(/".*/, "", line)
+    if ((" " line " ") !~ / test /) bad=1
+  }
+  END { exit (count == 8 && !bad ? 0 : 1) }
+' "${repo_root}/builder/build-usb-image.sh" \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install" \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-esp.sh"
+check "System ESP preflight checks the preserved GRUB owner" awk '
+  /^preflight_system_esp_boot_files\(\)/ { inside=1; functions++ }
+  inside && /^  esp_require_supported_grub / { found=1 }
+  inside && /^}/ { inside=0 }
+  END { exit (functions == 1 && found ? 0 : 1) }
+' "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "free-space and replace preflight before formatting" awk '
+  /^install_into_free_space\(\)/ || /^install_over_existing_root\(\)/ { inside=1; ready=0; count++ }
+  inside && /^  preflight_system_esp_boot_files / { ready=1 }
+  inside && /^[[:space:]]*(parted|cryptsetup|format_installed_btrfs) / { if (!ready) bad=1 }
+  inside && /^}/ { if (!ready) bad=1; inside=0 }
+  END { exit (count == 2 && !bad ? 0 : 1) }
+' "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "bootloader-only writes check compatibility before changing the ESP" awk '
+  /^apply_system_esp_bootloader\(\)/ { inside=1; functions++ }
+  inside && /^  esp_require_supported_grub / { ready=1 }
+  inside && /^(    esp_nvme_drop_unused_before_copy|  esp_copy_unique_kernels) / { if (!ready) bad=1; seen=1 }
+  inside && /^}/ { inside=0 }
+  END { exit (functions == 1 && ready && seen && !bad ? 0 : 1) }
+' "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "free-space reinstall defaults and locked-root preservation" bash "${repo_root}/test/esp-grub-reinstall"
 check "bash -n provisioning-chroot rehearsal" bash -n "${repo_root}/test/provisioning-chroot"
 check "bash -n real user provisioning rehearsal" bash -n "${repo_root}/test/provisioning-user-chroot"
 check "both System ESP install paths assert the ownership notice" bash -c \

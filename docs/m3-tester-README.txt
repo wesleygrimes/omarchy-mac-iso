@@ -123,6 +123,13 @@ is restored and the new UUID root is added through custom.cfg. The old menu
 and its default remain owned by the old installation. Its
 /vmlinuz-linux-asahi and /initramfs-linux-asahi.img are not overwritten.
 
+For an installer-managed default, a free-space reinstall detects when the
+previous root was erased in macOS and makes the new root the default.
+Confirmed-absent generated roots are omitted from the active menu; their
+saved fragments and kernels are retained. A still-present root, including
+a locked encrypted root, keeps its default. Customized/foreign boot menus
+remain under their original owner's control.
+
 
 3. Boot and capture the pre-install result
 ------------------------------------------
