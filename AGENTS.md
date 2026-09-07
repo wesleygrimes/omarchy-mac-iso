@@ -28,7 +28,7 @@ The USB GPT is ESP (`OMARCHYISO`) + btrfs payload (`OMARCHYLIVE`, subvol `@`).
 
 `refresh-live` must rebuild **both** when the live USB is plugged in. Updating only the install initrd leaves live boot on a stale `initramfs-omarchy-usb.img`.
 
-A full image is `sudo ./bin/omarchy-mac-iso-make --usb --rootfs` (pacstraps `omarchy-base.packages` plus sudo; 12GiB payload). That writes `payload.img` and ESP files; add `--disk-image` only when you want `omarchy-mac-usb.img` for `dd` onto a stick. The builder `pacman -Sy`s first and **fails** if a listed package is not in repos, not a remap, not a local tarball, and not in `packages-aarch64-skip`. Use refresh for installer scripts, GRUB cfg, and initrds on an existing stick. Refresh cannot grow the package set — that needs a rootfs rebuild. 1Password is not pre-installed; `omarchy-install-1password` after first boot sets the browser helper.
+A full image is `sudo ./bin/omarchy-mac-iso-make --usb --rootfs` (pacstraps `omarchy-base.packages` plus sudo; 12GiB payload). That writes `payload.img`, `payload.img.zst` (Drive/SHARE), and ESP files; add `--disk-image` only when you want `omarchy-mac-usb.img` for `dd` onto a stick. The builder `pacman -Sy`s first and **fails** if a listed package is not in repos, not a remap, not a local tarball, and not in `packages-aarch64-skip`. Use refresh for installer scripts, GRUB cfg, and initrds on an existing stick. Refresh cannot grow the package set — that needs a rootfs rebuild. 1Password is not pre-installed; `omarchy-install-1password` after first boot sets the browser helper.
 
 ## Installer paths
 

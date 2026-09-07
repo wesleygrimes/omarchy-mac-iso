@@ -61,6 +61,17 @@ esp_cleanup_nvme_live() {
     "$esp_mnt/grub/omarchy-nvme-had-bootloader"
 }
 
+# After restoring a pre-NVMe BOOTAA64, piggyback only if that owner still
+# has a GRUB config we can source. UEFI-only often has BOOTAA64 (U-Boot)
+# and no grub.cfg; writing custom.cfg there never boots the new root.
+# A leftover NVMe-live menu in grub.cfg is the same: own instead.
+esp_nvme_restore_can_piggyback() {
+  local esp=$1
+  [[ -f $esp/grub/grub.cfg ]] || return 1
+  ! grep -qE 'OMARCHY NVMe installer GRUB|Omarchy Mac live \(NVMe installer\)' \
+    "$esp/grub/grub.cfg"
+}
+
 write_shared_esp_notice() {
   local root_mnt=$1 esp_uuid=$2 mode=$3
   [[ $mode == piggyback ]] || return 0
@@ -125,12 +136,50 @@ esp_boot_sources() {
   printf '%s\t%s\n' "$kernel" "$initrd"
 }
 
+# NVMe-live files the installer does not copy from. The live session is
+# already running from the payload overlay, so the live initrd can go
+# before the unique-kernel copy. The unused install initrd (plain vs LUKS)
+# can go too. Do not list the kernel or the initrd esp_boot_sources picks.
+esp_nvme_unused_before_copy() {
+  local luks_uuid=${1:-}
+  printf '%s\n' initramfs-omarchy-nvme-live.img
+  if [[ -n $luks_uuid ]]; then
+    printf '%s\n' initramfs-omarchy-nvme-install-plain.img
+  else
+    printf '%s\n' initramfs-omarchy-nvme-install.img
+  fi
+}
+
+esp_nvme_unused_bytes() {
+  local esp_mnt=$1 luks_uuid=${2:-} rel total=0
+  while IFS= read -r rel; do
+    [[ -f $esp_mnt/$rel ]] || continue
+    total=$((total + $(stat -c %s "$esp_mnt/$rel")))
+  done < <(esp_nvme_unused_before_copy "$luks_uuid")
+  printf '%s\n' "$total"
+}
+
+esp_nvme_drop_unused_before_copy() {
+  local esp_mnt=$1 luks_uuid=${2:-} rel
+  while IFS= read -r rel; do
+    rm -f "$esp_mnt/$rel"
+  done < <(esp_nvme_unused_before_copy "$luks_uuid")
+}
+
 esp_require_kernel_copy_space() {
   local live_esp_mnt=$1 esp_mnt=$2 luks_uuid=${3:-} strict_nvme=${4:-0}
-  local sources kernel initrd need
+  local sources kernel initrd need reclaim=0
   sources=$(esp_boot_sources "$live_esp_mnt" "$luks_uuid" "$strict_nvme") || return 1
   IFS=$'\t' read -r kernel initrd <<<"$sources"
   need=$(( $(stat -c %s "$kernel") + $(stat -c %s "$initrd") + ESP_WRITE_SLACK_BYTES ))
+  if (( strict_nvme == 1 )); then
+    reclaim=$(esp_nvme_unused_bytes "$esp_mnt" "$luks_uuid")
+    if (( need > reclaim )); then
+      need=$((need - reclaim))
+    else
+      need=0
+    fi
+  fi
   esp_require_free_bytes "$esp_mnt" "$need"
 }
 
@@ -246,6 +295,39 @@ managed_default_matches_replacement() {
   grep -qF "cryptdevice=UUID=$old_luks_uuid:root:allow-discards" "$cfg"
 }
 
+# True when a UUID exists as a block device. Tests set ESP_UUID_DIR.
+esp_uuid_present() {
+  local uuid=$1 dir=${ESP_UUID_DIR:-/dev/disk/by-uuid}
+  [[ -n $uuid ]] || return 1
+  [[ -e $dir/$uuid ]]
+}
+
+# A leftover ISO shared-kernel line (/EFI/omarchy/vmlinuz) is stale when
+# none of its root= / cryptdevice= UUIDs are on disk. A living second
+# Omarchy root still has those UUIDs — do not rewrite it.
+esp_legacy_shared_kernel_stale() {
+  local cfg=$1 line uuid seen=0 live=0
+  [[ -f $cfg ]] || return 1
+  while IFS= read -r line; do
+    [[ $line == *'/EFI/omarchy/vmlinuz'* ]] || continue
+    seen=1
+    uuid=""
+    if [[ $line =~ cryptdevice=UUID=([0-9A-Fa-f-]+) ]]; then
+      uuid=${BASH_REMATCH[1]}
+    elif [[ $line =~ root=UUID=([0-9A-Fa-f-]+) ]]; then
+      uuid=${BASH_REMATCH[1]}
+    fi
+    if [[ -z $uuid ]]; then
+      live=1
+      continue
+    fi
+    if esp_uuid_present "$uuid"; then
+      live=1
+    fi
+  done <"$cfg"
+  (( seen == 1 && live == 0 ))
+}
+
 # Preserve an existing custom.cfg verbatim and add one stable include. Arch's
 # grub-mkconfig keeps custom.cfg and sources it, so UUID entries survive future
 # kernel updates by the GRUB-owning installation.
@@ -274,11 +356,13 @@ EOF
 
 # Piggyback on an OS that already owns BOOTAA64.EFI. Its grub.cfg, menu,
 # grubenv behavior, and custom.cfg contents remain owned by that OS.
+# A second living Omarchy root keeps that default. A leftover shared
+# /EFI/omarchy/vmlinuz line is rewritten only when its UUIDs are gone.
 write_piggyback_esp_grub() {
   local esp_mnt=$1 root_uuid=$2 luks_uuid=${3:-}
   local old_root_uuid=${4:-} old_luks_uuid=${5:-}
   local linux_args verbose_args entry_title kernel_dir root_cfg default_line=""
-  local default_uuid modify_grub=0
+  local default_uuid modify_grub=0 rewrite_legacy=0 cfg
   linux_args=$(root_linux_args "$root_uuid" "$luks_uuid")
   verbose_args=$(root_linux_args_verbose "$root_uuid" "$luks_uuid")
   entry_title="Omarchy Mac (root $root_uuid)"
@@ -298,12 +382,20 @@ write_piggyback_esp_grub() {
   fi
   write_managed_omarchy_grub "$esp_mnt" "$default_line" || return 1
   ensure_custom_sources_omarchy "$esp_mnt" || return 1
+  if [[ -n $old_root_uuid || -n $old_luks_uuid ]]; then
+    rewrite_legacy=1
+  fi
+  for cfg in "$esp_mnt/grub/grub.cfg" "$esp_mnt/grub/custom.cfg"; do
+    if esp_legacy_shared_kernel_stale "$cfg"; then
+      rewrite_legacy=1
+    fi
+  done
   if [[ -f $esp_mnt/grub/grub.cfg ]] && ! grep -Eq \
     '^[[:space:]]*((if .*;[[:space:]]*then[[:space:]]*)?(source|configfile)).*custom[.]cfg' \
     "$esp_mnt/grub/grub.cfg"; then
     modify_grub=1
   fi
-  if [[ -n $old_root_uuid || -n $old_luks_uuid ]] &&
+  if (( rewrite_legacy == 1 )) &&
     [[ -f $esp_mnt/grub/grub.cfg ]] && grep -q '/EFI/omarchy/vmlinuz' "$esp_mnt/grub/grub.cfg"; then
     modify_grub=1
   fi
@@ -319,15 +411,18 @@ if [ -f /grub/custom.cfg ]; then
 fi
 EOF
   fi
-  # Replace-existing only: migrate a legacy shared-kernel entry to this
-  # root's private kernel path. For a second root, leave the original entry.
-  if [[ -n $old_root_uuid || -n $old_luks_uuid ]] &&
-    [[ -f $esp_mnt/grub/grub.cfg ]] && grep -q '/EFI/omarchy/vmlinuz' "$esp_mnt/grub/grub.cfg"; then
-    sed -i -E \
-      -e "s|^([[:space:]]*)linux /EFI/omarchy/vmlinuz .*loglevel=3 quiet splash$|\\1linux $kernel_dir/vmlinuz $linux_args|" \
-      -e "s|^([[:space:]]*)linux /EFI/omarchy/vmlinuz .*loglevel=7$|\\1linux $kernel_dir/vmlinuz $verbose_args|" \
-      -e "s|^([[:space:]]*)initrd /EFI/omarchy/initramfs.img$|\\1initrd $kernel_dir/initramfs.img|" \
-      "$esp_mnt/grub/grub.cfg"
+  # Replace-existing, or a shared-kernel line whose UUIDs are no longer on
+  # disk. A living second root keeps /EFI/omarchy/vmlinuz as its entry.
+  if (( rewrite_legacy == 1 )); then
+    for cfg in "$esp_mnt/grub/grub.cfg" "$esp_mnt/grub/custom.cfg"; do
+      [[ -f $cfg ]] || continue
+      grep -q '/EFI/omarchy/vmlinuz' "$cfg" || continue
+      sed -i -E \
+        -e "s|^([[:space:]]*)linux /EFI/omarchy/vmlinuz .*loglevel=3 quiet splash$|\\1linux $kernel_dir/vmlinuz $linux_args|" \
+        -e "s|^([[:space:]]*)linux /EFI/omarchy/vmlinuz .*loglevel=7$|\\1linux $kernel_dir/vmlinuz $verbose_args|" \
+        -e "s|^([[:space:]]*)initrd /EFI/omarchy/initramfs.img$|\\1initrd $kernel_dir/initramfs.img|" \
+        "$cfg"
+    done
   fi
 }
 

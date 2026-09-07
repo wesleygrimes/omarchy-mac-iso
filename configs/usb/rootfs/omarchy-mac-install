@@ -562,6 +562,18 @@ install_boot_command_stubs() {
     'exit 0' \
     >"$stub_dir/omarchy-iso-chroot-skip-mise"
   chmod 755 "$stub_dir/omarchy-iso-chroot-skip-mise"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    'echo "ISO chroot skips optional apps (no network). Install 1Password later with omarchy-install-1password."' \
+    'return 0' \
+    >"$stub_dir/omarchy-iso-chroot-skip-optional-apps"
+  chmod 755 "$stub_dir/omarchy-iso-chroot-skip-optional-apps"
+  printf '%s\n' \
+    '#!/bin/bash' \
+    'echo "ISO chroot skips user-level electron-gl wrap (needs sudo); root writes /usr/local/bin after this"' \
+    'exit 0' \
+    >"$stub_dir/omarchy-iso-chroot-skip-electron-wrap"
+  chmod 755 "$stub_dir/omarchy-iso-chroot-skip-electron-wrap"
   iso_chroot_stub_binds=()
   for cmd in mkinitcpio grub-mkconfig limine-mkinitcpio; do
     install -m755 "$stub_dir/omarchy-iso-chroot-stub" \
@@ -575,11 +587,27 @@ install_boot_command_stubs() {
     mount --bind "$stub_dir/omarchy-iso-chroot-stub" "$dest"
     iso_chroot_stub_binds+=("$dest")
   done
-  dest="$root_mnt/usr/share/omarchy/bin/omarchy-install-1password"
-  if [[ -e $dest ]]; then
+  for dest in \
+    "$root_mnt/usr/share/omarchy/bin/omarchy-install-1password" \
+    "$root_mnt/usr/bin/omarchy-install-1password"
+  do
+    [[ -e $dest ]] || continue
     mount --bind "$stub_dir/omarchy-iso-chroot-skip-1password" "$dest"
     iso_chroot_stub_binds+=("$dest")
+  done
+  dest="$root_mnt/usr/share/omarchy/install/post-install/optional-apps.sh"
+  if [[ -e $dest ]]; then
+    mount --bind "$stub_dir/omarchy-iso-chroot-skip-optional-apps" "$dest"
+    iso_chroot_stub_binds+=("$dest")
   fi
+  for dest in \
+    "$root_mnt/usr/share/omarchy/bin/omarchy-cmd-electron-gl-wrap" \
+    "$root_mnt/usr/bin/omarchy-cmd-electron-gl-wrap"
+  do
+    [[ -e $dest ]] || continue
+    mount --bind "$stub_dir/omarchy-iso-chroot-skip-electron-wrap" "$dest"
+    iso_chroot_stub_binds+=("$dest")
+  done
   for dest in \
     "$root_mnt/usr/bin/mise" \
     "$root_mnt/usr/share/omarchy/bin/omarchy-mise-install"
@@ -601,7 +629,45 @@ remove_boot_command_stubs() {
     "$root_mnt/usr/local/sbin/limine-mkinitcpio" \
     "$root_mnt/usr/local/share/omarchy-mac-iso/omarchy-iso-chroot-stub" \
     "$root_mnt/usr/local/share/omarchy-mac-iso/omarchy-iso-chroot-skip-1password" \
-    "$root_mnt/usr/local/share/omarchy-mac-iso/omarchy-iso-chroot-skip-mise"
+    "$root_mnt/usr/local/share/omarchy-mac-iso/omarchy-iso-chroot-skip-mise" \
+    "$root_mnt/usr/local/share/omarchy-mac-iso/omarchy-iso-chroot-skip-optional-apps" \
+    "$root_mnt/usr/local/share/omarchy-mac-iso/omarchy-iso-chroot-skip-electron-wrap"
+}
+
+# User-level electron-gl.sh would sudo-tee /usr/local/bin. Write the
+# Chromium PATH wrapper as root after stubs are gone. 1Password is not
+# on the payload (optional-apps skipped); omarchy-install-1password later
+# installs that wrapper.
+seed_iso_chroot_electron_wrappers() {
+  local root_mnt=$1
+  [[ -x $root_mnt/usr/bin/chromium ]] || return 0
+  if [[ ! -x $root_mnt/usr/share/omarchy/bin/omarchy-cmd-electron-gl-wrap &&
+        ! -x $root_mnt/usr/bin/omarchy-cmd-electron-gl-wrap ]]; then
+    return 0
+  fi
+  if chroot "$root_mnt" env \
+      OMARCHY_PATH=/usr/share/omarchy \
+      PATH="/usr/share/omarchy/bin:/usr/bin:$PATH" \
+      omarchy-cmd-electron-gl-wrap chromium /usr/bin/chromium
+  then
+    printf '==> Chromium software-GL wrapper in /usr/local/bin\n'
+  else
+    printf '==> Chromium software-GL wrapper skipped; first login can retry\n'
+  fi
+}
+
+# ISO-installed roots do not ship linux-asahi. A leftover Alarm preset makes
+# every `mkinitcpio -P` (avd-fw, omarchy-mac) fail looking for
+# /boot/vmlinuz-linux-asahi. Pacman hooks would still error with "no presets
+# found", so disable those too. Boot images live on the ESP.
+disable_unmanaged_mkinitcpio() {
+  local root_mnt=$1 hook
+  rm -f "$root_mnt/etc/mkinitcpio.d/linux-asahi.preset"
+  for hook in 90-mkinitcpio-install.hook 60-mkinitcpio-remove.hook; do
+    [[ -f $root_mnt/usr/share/libalpm/hooks/$hook ]] || continue
+    mv "$root_mnt/usr/share/libalpm/hooks/$hook" \
+      "$root_mnt/usr/share/libalpm/hooks/$hook.disabled"
+  done
 }
 
 # login/alt-bootloaders.sh greps and copies this. The payload has no linux
@@ -715,8 +781,9 @@ provision_installed_system() {
   fi
   seed_no_hardware_cursors "$root_mnt" "$user"
 
-  target_chroot_unbind
   remove_boot_command_stubs "$root_mnt"
+  seed_iso_chroot_electron_wrappers "$root_mnt"
+  target_chroot_unbind
 }
 
 # Same baseline install.sh records at the end of a by-hand install, and the
@@ -785,6 +852,8 @@ personalize_graphical_session() {
   # setup form ("user + root"). If sudo is missing, su still works.
   printf '%s:%s\n' "$user" "$pass" | chpasswd --root "$root_mnt"
   printf 'root:%s\n' "$pass" | chpasswd --root "$root_mnt"
+
+  disable_unmanaged_mkinitcpio "$root_mnt"
 
   [[ -x $root_mnt/usr/bin/sudo ]] \
     || fail "sudo not in this payload — rebuild with --usb --rootfs"
@@ -1056,10 +1125,16 @@ apply_system_esp_bootloader() {
     [[ $source_mode == nvme ]] || fail "unexpected same-ESP boot source mode: $source_mode"
     strict_nvme=1
     force_own=1
+    # Live initrd and the unused install initrd are already in RAM / not
+    # copy sources. Drop them before the unique-kernel copy so a 500MiB
+    # ESP with a previous failed install can still fit the new pair.
+    esp_nvme_drop_unused_before_copy "$esp_mnt" "$luks_uuid"
     if [[ -f $esp_mnt/grub/omarchy-nvme-had-bootloader ]]; then
       esp_restore_nvme_preinstall_bootloader "$esp_mnt" \
         || fail "NVMe placer recorded an existing bootloader but its backup cannot be restored"
-      force_own=0
+      if esp_nvme_restore_can_piggyback "$esp_mnt"; then
+        force_own=0
+      fi
     fi
   fi
   before_efi=$(sha256sum "$esp_mnt/EFI/BOOT/BOOTAA64.EFI" 2>/dev/null || true)

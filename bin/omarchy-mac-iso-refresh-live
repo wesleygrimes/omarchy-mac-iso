@@ -180,6 +180,15 @@ if [[ -n $iso ]]; then
   iso_mnt=$(mount_if_needed "$iso")
   cp -a "$out" "$iso_mnt/initramfs-linux-asahi.img"
   echo "==> wrote $iso_mnt/initramfs-linux-asahi.img"
+  plain_out=/tmp/initramfs-linux-asahi-plain.img
+  echo "==> mkinitcpio unencrypted install initrd"
+  mkinitcpio -n \
+    -c "$repo_root/configs/usb-initcpio/mkinitcpio-install-plain.conf" \
+    "${mkinitcpio_dirs[@]}" \
+    -k "$kver" \
+    -g "$plain_out"
+  cp -a "$plain_out" "$iso_mnt/initramfs-linux-asahi-plain.img"
+  echo "==> wrote $iso_mnt/initramfs-linux-asahi-plain.img"
   live_out=/tmp/initramfs-omarchy-usb.img
   echo "==> mkinitcpio live initrd (quiet console before switch_root)"
   mkinitcpio -n \

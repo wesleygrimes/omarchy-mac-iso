@@ -28,8 +28,13 @@ log "verifying build checksums"
 (cd "$build_dir" && sha256sum -c SHA256SUMS)
 
 mkdir -p "$drop_dir/src"
-log "compressing payload.img"
-zstd -T0 -6 "$build_dir/payload.img" -o "$drop_dir/payload.img.zst"
+if [[ -f $build_dir/payload.img.zst ]]; then
+  log "reusing $build_dir/payload.img.zst"
+  cp "$build_dir/payload.img.zst" "$drop_dir/payload.img.zst"
+else
+  log "compressing payload.img"
+  zstd -T0 -19 "$build_dir/payload.img" -o "$drop_dir/payload.img.zst"
+fi
 
 for name in vmlinuz-linux-asahi initramfs-omarchy-usb.img \
   initramfs-linux-asahi.img initramfs-linux-asahi-plain.img \

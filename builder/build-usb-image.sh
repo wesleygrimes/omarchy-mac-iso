@@ -52,6 +52,7 @@ fi
 log "appledrm $appledrm_ko (v14.7 ok)"
 command -v mkinitcpio >/dev/null || fail "mkinitcpio not found (pacman -S mkinitcpio)"
 command -v grub-mkstandalone >/dev/null || fail "grub-mkstandalone not found (pacman -S grub)"
+command -v zstd >/dev/null || fail "zstd not found (pacman -S zstd)"
 wrap_disk=0
 [[ ${OMARCHY_USB_DISK_IMAGE:-} == 1 ]] && wrap_disk=1
 if (( wrap_disk == 1 )); then
@@ -66,7 +67,13 @@ work="$(mktemp -d -p /var/tmp omarchy-mac-iso.XXXXXX)"
 log "work dir $work (not /tmp tmpfs)"
 loop_dev=""
 esp_priv=0
+modules_bind=0
+host_moddir=/lib/modules/$kver
 cleanup() {
+  if (( modules_bind == 1 )); then
+    umount "$host_moddir" 2>/dev/null || umount -l "$host_moddir" 2>/dev/null || true
+    rmdir "$host_moddir" 2>/dev/null || true
+  fi
   if [[ -n $loop_dev ]]; then
     if (( esp_priv == 1 )); then
       umount "$loop_dev" 2>/dev/null || umount -l "$loop_dev" 2>/dev/null || true
@@ -103,6 +110,19 @@ for dir in /usr/lib/initcpio /usr/local/share/omarchy-mac-iso/initcpio; do
 done
 [[ -n $asahi_hook ]] \
   || fail "asahi mkinitcpio hook missing (looked in /usr/lib/initcpio and /usr/local/share/omarchy-mac-iso/initcpio)"
+
+# mkinitcpio -k $kver only reads /lib/modules/$kver. A side-loaded tree
+# (OMARCHY_MODULES_DIR) is not visible unless it is mounted there. Use a
+# bind mount, not a symlink: kms find() does not follow a modules-dir link.
+if [[ ! -d $host_moddir/kernel ]]; then
+  [[ -d $moddir/kernel ]] \
+    || fail "no kernel/ under $moddir (set OMARCHY_MODULES_DIR)"
+  mkdir -p "$host_moddir"
+  mount --bind "$moddir" "$host_moddir" \
+    || fail "could not bind $moddir onto $host_moddir for mkinitcpio"
+  modules_bind=1
+  log "bound $moddir -> $host_moddir for mkinitcpio"
+fi
 
 log "Building live initramfs (linux-asahi $kver, dwc3-apple)"
 mkinitcpio -n \
@@ -241,9 +261,15 @@ kernel_config=${OMARCHY_KERNEL_CONFIG:-$moddir/build/.config}
 if [[ -f $kernel_config ]]; then
   cp "$kernel_config" "$out_dir/linux-asahi.config"
 fi
+# SHARE / Drive copies cannot hold the 12GiB raw payload. Keep payload.img
+# on the builder for loop-mounts; testers take payload.img.zst.
+zstd_level=${OMARCHY_PAYLOAD_ZSTD_LEVEL:-19}
+log "compressing payload.img (zstd -$zstd_level) for testers"
+zstd -T0 -"$zstd_level" -f "$out_dir/payload.img" -o "$out_dir/payload.img.zst"
 # mkinitcpio writes 600; the release dir is for copying onto a Mac.
 chmod a+r "$out_dir"/initramfs-*.img "$out_dir"/vmlinuz-linux-asahi \
-  "$out_dir"/payload.img "$out_dir"/BOOTAA64.EFI "$out_dir"/BOOTAA64-NVME.EFI
+  "$out_dir"/payload.img "$out_dir"/payload.img.zst \
+  "$out_dir"/BOOTAA64.EFI "$out_dir"/BOOTAA64-NVME.EFI
 
 git_ref="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)"
 source_state=clean
@@ -269,12 +295,12 @@ payload_kind="busybox pid 1"
     printf 'flash: dd if=omarchy-mac-usb.img of=/dev/sdX bs=4M status=progress conv=fsync\n'
   else
     printf 'contract: NVMe/live installer files (no GPT disk image)\n'
-    printf '  payload.img (btrfs OMARCHYLIVE subvol=@)\n'
+    printf '  payload.img (btrfs OMARCHYLIVE subvol=@) and payload.img.zst for testers\n'
     printf '  BOOTAA64.EFI BOOTAA64-NVME.EFI vmlinuz-linux-asahi initramfs-omarchy-usb.img\n'
     printf '  initramfs-linux-asahi.img initramfs-linux-asahi-plain.img\n'
     printf '  grub-nvme-installer.cfg\n'
     printf '  payload: %s\n' "$payload_kind"
-    printf 'place: scripts/macos/place-nvme-installer.sh --payload payload.img --esp-files .\n'
+    printf 'place: scripts/macos/place-nvme-installer.sh --payload payload.img.zst --esp-files .\n'
     printf 'disk-image: pass --disk-image to also wrap omarchy-mac-usb.img\n'
   fi
 } >"$out_dir/BUILD_INFO"
@@ -292,6 +318,6 @@ chmod a+r "$out_dir/BUILD_INFO" "$out_dir/SHA256SUMS"
 
 if (( wrap_disk == 1 )); then
   log "Wrote $disk ($(du -h "$disk" | cut -f1))"
-else
-  log "Wrote $out_dir/payload.img ($(du -h "$out_dir/payload.img" | cut -f1))"
 fi
+log "Wrote $out_dir/payload.img ($(du -h "$out_dir/payload.img" | cut -f1))"
+log "Wrote $out_dir/payload.img.zst ($(du -h "$out_dir/payload.img.zst" | cut -f1))"

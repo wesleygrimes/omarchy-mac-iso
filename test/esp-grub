@@ -162,6 +162,30 @@ check "external USB cleanup preserves a pending NVMe placement" \
 esp_cleanup_nvme_live "$cleanup_esp" nvme
 check "consumed NVMe cleanup removes its private placement files" \
   "[[ ! -e '$cleanup_esp/vmlinuz-omarchy-nvme-live' && ! -e '$cleanup_esp/omarchy-nvme-live' ]]"
+tight=$work/tight-nvme-esp
+mkdir -p "$tight"
+printf 'live-initrd\n' >"$tight/initramfs-omarchy-nvme-live.img"
+printf 'plain-initrd-xxxxxxxx\n' >"$tight/initramfs-omarchy-nvme-install-plain.img"
+printf 'luks-initrd\n' >"$tight/initramfs-omarchy-nvme-install.img"
+check "LUKS NVMe copy may drop the live initrd and the unused plain initrd" \
+  "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; out=\$(esp_nvme_unused_before_copy luks-uuid); grep -qx initramfs-omarchy-nvme-live.img <<<"\$out" && grep -qx initramfs-omarchy-nvme-install-plain.img <<<"\$out" && ! grep -q initramfs-omarchy-nvme-install.img <<<"\$out""
+check "unencrypted NVMe copy keeps the plain initrd as its source" \
+  "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; out=\$(esp_nvme_unused_before_copy); grep -qx initramfs-omarchy-nvme-install.img <<<"\$out" && ! grep -q initramfs-omarchy-nvme-install-plain.img <<<"\$out""
+esp_nvme_drop_unused_before_copy "$tight" luks-uuid
+check "dropping unused NVMe files keeps the LUKS install initrd" \
+  "[[ ! -e '$tight/initramfs-omarchy-nvme-live.img' && ! -e '$tight/initramfs-omarchy-nvme-install-plain.img' && -f '$tight/initramfs-omarchy-nvme-install.img' ]]"
+mkdir -p "$work/uefi-only/grub"
+check "UEFI-only ESP without grub.cfg cannot piggyback after NVMe restore" \
+  "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; ! esp_nvme_restore_can_piggyback '$work/uefi-only'"
+mkdir -p "$work/nvme-live-grub/grub" "$work/owner-grub/grub"
+printf '%s\n' "echo 'OMARCHY NVMe installer GRUB'" \
+  >"$work/nvme-live-grub/grub/grub.cfg"
+printf '%s\n' "menuentry 'Existing omarchy-mac root' {}" \
+  >"$work/owner-grub/grub/grub.cfg"
+check "NVMe-live grub.cfg cannot piggyback after restore" \
+  "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; ! esp_nvme_restore_can_piggyback '$work/nvme-live-grub'"
+check "an owning grub-mkconfig config can piggyback after NVMe restore" \
+  "source '$repo_root/configs/usb/rootfs/omarchy-mac-esp.sh'; esp_nvme_restore_can_piggyback '$work/owner-grub'"
 notice_root=$work/notice-root
 mkdir -p "$notice_root/etc"
 write_shared_esp_notice "$notice_root" A1B2-C3D4 own
@@ -314,6 +338,43 @@ check "piggyback rewrites a leftover Omarchy Mac linux line" \
   "grep -q 'root=UUID=11111111-2222-3333-4444-555555555555' '$pig/grub/grub.cfg' && grep -q 'cryptdevice=UUID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:root:allow-discards' '$pig/grub/grub.cfg'"
 check "piggyback leftover rewrite drops the old root UUID" \
   "! grep -q 99999999-8888-7777-6666-555555555555 '$pig/grub/grub.cfg'"
+uuid_dir=$work/fake-by-uuid
+mkdir -p "$uuid_dir"
+stale=$work/stale-shared-esp
+stale_uuid=77777777-8888-9999-aaaa-bbbbbbbbbbbb
+stale_luks=88888888-9999-aaaa-bbbb-cccccccccccc
+mkdir -p "$stale/EFI/BOOT" "$stale/grub"
+printf 'owner-efi\n' >"$stale/EFI/BOOT/BOOTAA64.EFI"
+printf '%s\n' \
+  "set default=0" \
+  "menuentry 'Omarchy Mac' {" \
+  "  linux /EFI/omarchy/vmlinuz root=UUID=dead-root rw cryptdevice=UUID=dead-luks:root:allow-discards loglevel=3 quiet splash" \
+  "  initrd /EFI/omarchy/initramfs.img" \
+  "}" \
+  'if [ -f /grub/custom.cfg ]; then source /grub/custom.cfg; fi' \
+  >"$stale/grub/grub.cfg"
+ESP_UUID_DIR="$uuid_dir" write_piggyback_esp_grub "$stale" "$stale_uuid" \
+  "$stale_luks"
+check "a stale shared-kernel entry is rewritten without stealing another root's default" \
+  "grep -q '/EFI/omarchy/$stale_uuid/vmlinuz' '$stale/grub/grub.cfg' && ! grep -q 'set default=' '$stale/grub/omarchy.cfg'"
+check "a stale shared-kernel rewrite drops the dead UUID" \
+  "! grep -q dead-root '$stale/grub/grub.cfg'"
+live_shared=$work/live-shared-esp
+live_uuid=aaaaaaaa-bbbb-cccc-dddd-eeeeeeee0001
+mkdir -p "$live_shared/EFI/BOOT" "$live_shared/grub" "$uuid_dir"
+: >"$uuid_dir/old-root"
+printf 'owner-efi\n' >"$live_shared/EFI/BOOT/BOOTAA64.EFI"
+printf '%s\n' \
+  "set default=0" \
+  "menuentry 'Omarchy Mac' {" \
+  "  linux /EFI/omarchy/vmlinuz root=UUID=old-root rw loglevel=3 quiet splash" \
+  "  initrd /EFI/omarchy/initramfs.img" \
+  "}" \
+  'if [ -f /grub/custom.cfg ]; then source /grub/custom.cfg; fi' \
+  >"$live_shared/grub/grub.cfg"
+ESP_UUID_DIR="$uuid_dir" write_piggyback_esp_grub "$live_shared" "$live_uuid"
+check "a living shared-kernel entry is left for the other Omarchy root" \
+  "grep -q 'root=UUID=old-root' '$live_shared/grub/grub.cfg'"
 check "replacing a non-default root leaves the managed default untouched" \
   "grep -q \"set default='Omarchy Mac (root $first_uuid)'\" '$pig/grub/omarchy.cfg'"
 printf '%s\n' \
@@ -324,7 +385,9 @@ printf '%s\n' \
   "}" \
   'if [ -f /grub/custom.cfg ]; then source /grub/custom.cfg; fi' \
   >"$pig/grub/grub.cfg"
-write_piggyback_esp_grub "$pig" "11111111-2222-3333-4444-555555555555"
+: >"$uuid_dir/old-root"
+ESP_UUID_DIR="$uuid_dir" write_piggyback_esp_grub "$pig" \
+  "11111111-2222-3333-4444-555555555555"
 check "free-space piggyback does not steal the managed GRUB default" \
   "grep -q \"set default='Omarchy Mac (root $first_uuid)'\" '$pig/grub/omarchy.cfg'"
 check "free-space piggyback leaves the original linux line" \

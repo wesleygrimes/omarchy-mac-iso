@@ -18,7 +18,7 @@ On a machine that already runs `linux-asahi`:
 sudo ./bin/omarchy-mac-iso-make --usb --rootfs
 ```
 
-Writes `release/omarchy-mac-iso-usb/` — the files the NVMe placer copies (`payload.img`, `vmlinuz-linux-asahi`, the live, encrypted-install, and plain-install initrds, `BOOTAA64-NVME.EFI`, `grub-nvme-installer.cfg`). It does **not** wrap `omarchy-mac-usb.img` unless you also pass `--disk-image`.
+Writes `release/omarchy-mac-iso-usb/` — the files the NVMe placer copies (`payload.img`, `payload.img.zst`, `vmlinuz-linux-asahi`, the live, encrypted-install, and plain-install initrds, `BOOTAA64-NVME.EFI`, `grub-nvme-installer.cfg`). Testers on Drive or SHARE take the `.zst`, not the 12GiB raw image. It does **not** wrap `omarchy-mac-usb.img` unless you also pass `--disk-image`.
 
 Every build writes `BUILD_INFO` with the full source commit, dirty/clean state, kernel version, and optional `OMARCHY_KERNEL_SOURCE_REF`, plus `SHA256SUMS` for the generated files. To make a self-contained tester directory without manually copying stale files:
 
@@ -28,9 +28,10 @@ Every build writes `BUILD_INFO` with the full source commit, dirty/clean state, 
   release/omarchy-mac-apple-silicon-preview-1
 ```
 
-The destination must not already exist. The packager verifies the build manifest, compresses the payload, copies the current instructions and collectors, and generates a new manifest for the complete drop.
+The destination must not already exist. The packager verifies the build manifest, reuses `payload.img.zst` from the build (or compresses `payload.img` if that file is missing), copies the current instructions and collectors, and generates a new manifest for the complete drop.
 
-- `payload.img` — btrfs labelled `OMARCHYLIVE`, subvol `@` (what macOS `dd`s onto `omarchy-install`)
+- `payload.img` — btrfs labelled `OMARCHYLIVE`, subvol `@` (builder copy; macOS `dd`s the decompressed image onto `omarchy-install`)
+- `payload.img.zst` — same payload for Drive / SHARE / the macOS placer (`--payload payload.img.zst`)
 - `omarchy-mac-usb.img` — only with `--disk-image`: GPT ESP `OMARCHYISO` + that payload, for `dd` onto a USB stick. Never onto the internal SSD
 
 Live session is tty autologin (`multi-user.target`), not a graphical login. Default payload is 12GiB with zstd; a 16GB stick is the floor. Override with `OMARCHY_USB_PAYLOAD_BYTES`.
@@ -54,12 +55,12 @@ Copying files onto an existing FAT stick is not enough — the payload is its ow
 
 M3 Type-C often never appears in U-Boot. After Asahi **UEFI-only** (M3: `EXPERT=true` and `curl -L https://alx.sh/dev | sh`, firmware 14.8.3), you need an **unallocated** GPT hole (shrink APFS from macOS, or `diskutil eraseVolume free none` on an existing Linux slice only — never APFS / Recovery / the `m1n1` ESP). Hole size should be about **twice** the payload (copy + installer) plus slack.
 
-Copy `payload.img`, all three initrds, `vmlinuz-linux-asahi`, `BOOTAA64-NVME.EFI`, and `grub-nvme-installer.cfg` onto the Mac, plus `scripts/macos/place-nvme-installer.sh`. Do **not** `dd` `omarchy-mac-usb.img` onto the internal disk.
+Copy `payload.img.zst`, all three initrds, `vmlinuz-linux-asahi`, `BOOTAA64-NVME.EFI`, and `grub-nvme-installer.cfg` onto the Mac, plus `scripts/macos/place-nvme-installer.sh`. Do **not** upload `payload.img` (12GiB) or `dd` `omarchy-mac-usb.img` onto the internal disk.
 
 ```
 # Dry-run first. --confirm writes.
 sudo ./place-nvme-installer.sh \
-  --payload ./payload.img \
+  --payload ./payload.img.zst \
   --esp-files .
 ```
 

@@ -28,9 +28,9 @@ Default: M0 QEMU artifact (Alpine linux-virt kernel + initramfs) into
 release/omarchy-mac-iso-arm64/. Does not boot a Mac.
 
 --usb: native Apple Silicon files into release/omarchy-mac-iso-usb/
-(payload.img, vmlinuz, initrds, USB and NVMe BOOTAA64 EFI files). Requires linux-asahi
-on the host. Tiny busybox pid 1, unprivileged. Does not wrap a GPT
-disk image unless --disk-image is also passed.
+(payload.img, payload.img.zst, vmlinuz, initrds, USB and NVMe BOOTAA64 EFI
+files). Requires linux-asahi on the host. Tiny busybox pid 1, unprivileged.
+Does not wrap a GPT disk image unless --disk-image is also passed.
 
 --usb --rootfs: pacstrap Arch `base` plus omarchy-base.packages (the
 script-based install set, including sudo) into the payload instead of

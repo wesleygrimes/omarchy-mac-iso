@@ -326,6 +326,16 @@ cp -a "$modules_src" "$mnt/usr/lib/modules/$kver"
 [[ -f $mnt/usr/lib/modules/$kver/kernel/drivers/gpu/drm/apple/appledrm.ko ]] \
   || fail "no appledrm.ko in copied modules"
 
+# linux-asahi is forbidden, so /boot/vmlinuz-linux-asahi never exists.
+# Alarm/base can still leave a preset; mkinitcpio -P (avd-fw, omarchy-mac)
+# then fails on every ISO-installed host. Boot images live on the ESP.
+rm -f "$mnt/etc/mkinitcpio.d/linux-asahi.preset"
+for hook in 90-mkinitcpio-install.hook 60-mkinitcpio-remove.hook; do
+  [[ -f $mnt/usr/share/libalpm/hooks/$hook ]] || continue
+  mv "$mnt/usr/share/libalpm/hooks/$hook" \
+    "$mnt/usr/share/libalpm/hooks/$hook.disabled"
+done
+
 # Same drop-in bootstrap.sh / omarchy-provision-owner write. Arch `base`
 # comments %wheel out of /etc/sudoers; without this, pacstrap'd sudo cannot
 # elevate the desktop user after install.

@@ -58,6 +58,18 @@ check "GPT wrap is opt-in" grep -q 'OMARCHY_USB_DISK_IMAGE' \
 check "default USB build skips the GPT wrap" grep -q \
   'Skipping GPT disk image' \
   "${repo_root}/builder/build-usb-image.sh"
+check "USB build writes payload.img.zst for testers" grep -q \
+  'payload.img.zst' \
+  "${repo_root}/builder/build-usb-image.sh"
+check "USB build bind-mounts a side-loaded modules dir for mkinitcpio" grep -q \
+  'mount --bind "$moddir"' \
+  "${repo_root}/builder/build-usb-image.sh"
+check "USB build requires zstd" grep -q \
+  'zstd not found' \
+  "${repo_root}/builder/build-usb-image.sh"
+check "tester-drop packager reuses a prebuilt payload.img.zst" grep -q \
+  'reusing $build_dir/payload.img.zst' \
+  "${repo_root}/bin/omarchy-mac-iso-package-tester-drop"
 check "omarchy-mac-iso-boot --help works offline" "${repo_root}/bin/omarchy-mac-iso-boot" --help
 check "usb grub.cfg finds initramfs-omarchy-usb.img" \
   grep -q initramfs-omarchy-usb.img "${repo_root}/configs/usb/grub.cfg"
@@ -181,6 +193,15 @@ check "rootfs compresses the payload with zstd" grep -q 'compress=zstd:1' \
   "${repo_root}/builder/build-rootfs.sh"
 check "rootfs still tmpfs-isolates /boot" grep -q 'mount -t tmpfs tmpfs "$mnt/boot"' \
   "${repo_root}/builder/build-rootfs.sh"
+check "rootfs drops leftover linux-asahi.preset" grep -q \
+  'mkinitcpio.d/linux-asahi.preset' \
+  "${repo_root}/builder/build-rootfs.sh"
+check "rootfs disables pacman mkinitcpio rebuild hooks" grep -q \
+  '$hook.disabled' \
+  "${repo_root}/builder/build-rootfs.sh"
+check "installer drops leftover linux-asahi.preset" grep -q \
+  'disable_unmanaged_mkinitcpio' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "rootfs unmounts nested pacstrap mounts" grep -q 'umount -R' \
   "${repo_root}/builder/build-rootfs.sh"
 check "hid_apple fnmode=1 is in the tree" grep -q 'fnmode=1' \
@@ -289,11 +310,31 @@ check "installer stubs omarchy-pkg-add in the target chroot" grep -q \
 check "ISO chroot skips pre-installing 1Password" grep -q \
   'ISO chroot skips 1Password' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "ISO chroot bind-stubs optional-apps.sh" grep -q \
+  'ISO chroot skips optional apps (no network)' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "ISO chroot bind-stubs /usr/bin/omarchy-install-1password too" grep -q \
+  'usr/bin/omarchy-install-1password' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "ISO chroot skips mise without a bundled Node tarball" grep -q \
   'ISO chroot skips mise' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "ISO chroot stubs live outside /tmp" grep -q \
   'usr/local/share/omarchy-mac-iso' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "ISO chroot stubs electron-gl wrap so provision-user does not sudo" grep -q \
+  'ISO chroot skips user-level electron-gl wrap' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "ISO chroot writes Chromium GL wrapper as root after stubs" \
+  bash -c 'b=$(sed -n "/^seed_iso_chroot_electron_wrappers()/,/^}/p" "$1"); [[ -n $b ]] &&
+    grep -qF "$2" <<<"$b" && ! grep -q runuser <<<"$b"' \
+  bash "${repo_root}/configs/usb/rootfs/omarchy-mac-install" \
+  'omarchy-cmd-electron-gl-wrap chromium /usr/bin/chromium'
+check "electron GL wrapper is written after chroot stubs are removed" \
+  awk '/^provision_installed_system\(\)/{p=1}
+       p && /remove_boot_command_stubs/{r=1}
+       p && r && /seed_iso_chroot_electron_wrappers/{s=1}
+       p && /^}/{exit (s ? 0 : 1)}' \
   "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
 check "free-space does not skip an NVMe live disk" \
   bash -c 'awk "/^install_into_free_space\\(\\)/,/^existing_root_row/" "'"${repo_root}"'/configs/usb/rootfs/omarchy-mac-install" | grep -q "disk_is_nvme \"\$name\""'
@@ -601,6 +642,9 @@ check "live GRUB masks plymouth on the installer USB" grep -q \
 check "refresh-live rebuilds the live initramfs" grep -q \
   initramfs-omarchy-usb.img \
   "${repo_root}/bin/omarchy-mac-iso-refresh-live"
+check "refresh-live rebuilds the unencrypted install initrd" grep -q \
+  initramfs-linux-asahi-plain.img \
+  "${repo_root}/bin/omarchy-mac-iso-refresh-live"
 check "live hook quiets printk before switch_root" grep -q 'dmesg -n 1' \
   "${repo_root}/configs/usb-initcpio/hooks/omarchy-usb-live"
 check "live rootfs hides systemd boot status" grep -q 'ShowStatus=no' \
@@ -707,6 +751,27 @@ check "usb-wait does not succeed on OMARCHYROOT when UUID is set" grep -q \
 check "usb-wait prefers cryptdevice UUID over root UUID" grep -q \
   'omarchy-usb-wait: cryptdevice UUID=' \
   "${repo_root}/configs/usb-initcpio/hooks/omarchy-usb-wait"
+check "usb-wait finds NVMe UUIDs via blkid when udev lags" grep -q \
+  'ensure_uuid_symlink' \
+  "${repo_root}/configs/usb-initcpio/hooks/omarchy-usb-wait"
+check "usb-wait walks /dev/nvme partitions" grep -q \
+  '/dev/nvme' \
+  "${repo_root}/configs/usb-initcpio/hooks/omarchy-usb-wait"
+check "usb-wait install hook ships blkid" grep -q \
+  'add_binary /usr/bin/blkid' \
+  "${repo_root}/configs/usb-initcpio/install/omarchy-usb-wait"
+check "NVMe restore piggybacks only when owner grub.cfg is usable" grep -q \
+  'esp_nvme_restore_can_piggyback' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "NVMe install drops unused live initrds before the kernel copy" grep -q \
+  'esp_nvme_drop_unused_before_copy' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-install"
+check "stale shared-kernel GRUB lines are rewritten without stealing default" grep -q \
+  'esp_legacy_shared_kernel_stale' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-esp.sh"
+check "NVMe space check credits files it will delete before copy" grep -q \
+  'esp_nvme_unused_bytes' \
+  "${repo_root}/configs/usb/rootfs/omarchy-mac-esp.sh"
 check "install initramfs runs encrypt after the USB wait" grep -q \
   'omarchy-usb-wait encrypt omarchy-crypt-nokeyring filesystems' \
   "${repo_root}/configs/usb-initcpio/mkinitcpio-install.conf"
