@@ -16,8 +16,8 @@ MUST, MUST NOT, and MAY are used as in RFC 2119. Rules are numbered (S-, H-, P-,
 Stage handoff uses these artifacts:
 
 - H1. GPT name `omarchy-install` on the installer slice.
-- H2. `omarchy-mac-consume-installer.service` enabled in the new root (`multi-user.target`).
-- H3. A versioned prepared-install manifest on the System ESP. It MUST identify the disk and installer slice by stable identifiers, record their expected GPT geometry, and contain SHA-256 digests for the payload and ESP artifacts. It MUST NOT contain passwords, password hashes, recovery keys, or other secrets. Goal vs today: the placer does not emit this manifest and the Linux installer does not consume it yet.
+- H2. A package-owned reclaim helper and `omarchy-mac-consume-installer.service`, enabled in the new root (`multi-user.target`). The installer MUST only enable the vendor unit and write transaction state; it MUST NOT generate or overwrite the packaged helper or unit. Goal vs today: the installer copies the helper to `/usr/local/sbin` and the unit to `/etc/systemd/system`.
+- H3. A versioned prepared-install manifest on the System ESP, at a path and with a schema agreed by the macOS producer and Linux consumer owners before implementation. It MUST identify the disk and installer slice by stable identifiers, record their expected GPT geometry, and contain SHA-256 digests for the payload and ESP artifacts. Unsupported schema versions MUST refuse. It MUST NOT contain passwords, password hashes, recovery keys, or other secrets. Goal vs today: the placer does not emit this manifest and the Linux installer does not consume it yet.
 
 The ESP live marker and boot files select the boot path; they are not authority to identify a partition for mutation. Reclaim MAY keep private durable progress in the new root. That progress is internal state, not a producer-to-consumer handoff artifact, and MUST NOT contain secrets.
 
