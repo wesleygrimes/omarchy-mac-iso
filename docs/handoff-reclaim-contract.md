@@ -13,16 +13,20 @@ MUST, MUST NOT, and MAY are used as in RFC 2119. Rules are numbered (S-, H-, P-,
 
 ## Handoff
 
-Exactly two artifacts carry state between stages. Nothing else is a channel.
+Stage handoff uses these artifacts:
 
 - H1. GPT name `omarchy-install` on the installer slice.
 - H2. `omarchy-mac-consume-installer.service` enabled in the new root (`multi-user.target`).
+- H3. A versioned prepared-install manifest on the System ESP. It MUST identify the disk and installer slice by stable identifiers, record their expected GPT geometry, and contain SHA-256 digests for the payload and ESP artifacts. It MUST NOT contain passwords, password hashes, recovery keys, or other secrets. Goal vs today: the placer does not emit this manifest and the Linux installer does not consume it yet.
+
+The ESP live marker and boot files select the boot path; they are not authority to identify a partition for mutation. Reclaim MAY keep private durable progress in the new root. That progress is internal state, not a producer-to-consumer handoff artifact, and MUST NOT contain secrets.
 
 ## Shared rules
 
 - S1. Apple partitions MUST NOT be shrunk, erased, reformatted, or deleted. `m1n1/`, `vendorfw/`, and `asahi/` MUST be hash-identical after every stage.
-- S2. Unclear identity MUST refuse. No stage deletes by disk position, size, or elimination.
+- S2. Unclear or non-unique identity MUST refuse. No stage deletes by disk position, size, or elimination.
 - S3. The unlock password MUST NOT be written anywhere: macOS, ESP, logs, installer slice.
+- S4. Once H3 is implemented, every mutating stage MUST validate the manifest schema version, artifact digests, disk identity, PARTUUIDs, and expected geometry before its first mutation. Reclaim MUST re-check the identity and geometry expected for its current durable stage before each later mutation.
 
 ## Stage 1 — Place (macOS)
 
@@ -58,9 +62,10 @@ Preconditions: root on NVMe. `/omarchy-mac-overlay-write` absent.
 
 Rules:
 
-- R1. The target is the partition on the root's disk with GPT name `omarchy-install`. It MUST NOT be the running root, mounted, or an Apple partition type.
+- R1. While reclaim is incomplete, the target is exactly one partition on the root's disk with GPT name `omarchy-install`. Zero or multiple matches MUST refuse except for the R2 fallback or a durable stage at or after `installer-deleted`. The target MUST NOT be the running root, mounted, or an Apple partition type.
 - R2. Fallback: when no partition has that name, a partition with filesystem label `OMARCHYLIVE` that is not the root MAY be named `omarchy-install` first. R1 still gates the delete. Goal vs today: the goal is exactly one candidate, else refuse; the code takes the first match.
 - R3. The root MUST grow only into the hole the delete left, then `cryptsetup resize` if LUKS, then `btrfs filesystem resize max`. It MUST NOT grow to end of disk.
-- R4. Apple partition entries MUST be snapshotted before the delete and MUST be identical after the delete and after the grow. Any difference fails the run.
+- R4. Before the first mutation, reclaim MUST durably snapshot every APFS, iBoot, Recovery, and System ESP GPT entry's PARTUUID, type GUID, start, end, size, attributes, and relative ordering. It MUST compare the current entries with that snapshot before and after every later mutation. Those fields MUST remain identical; any difference fails the run. Goal vs today: the current snapshot records only the kernel device name and type GUID.
+- R5. Reclaim MUST record progress atomically in the new root using these durable stages: `validated`, `installer-deleted`, `partition-grown`, `luks-grown`, `btrfs-grown`, and `complete`. On every run it MUST verify observed disk state against the recorded stage and continue at the first incomplete stage. If an interruption completed the next mutation before its stage was recorded, reclaim MUST verify that exact expected result, advance the durable stage, and continue. Any other contradiction MUST refuse. It MUST NOT infer completion merely because `omarchy-install` is absent. Goal vs today: reclaim has no durable progress record.
 
-Postconditions: no `omarchy-install` on the disk. Root grown. Service disabled. A re-run is a no-op.
+Postconditions: no `omarchy-install` on the disk. GPT root, LUKS mapping when present, and btrfs all grown. Durable stage `complete`. Service disabled. A re-run MUST converge to these postconditions; it is a no-op only when they are already satisfied.
